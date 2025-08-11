@@ -693,4 +693,21 @@ class AuditQueries:
         modified_by_user_id = :user_id,
         modified_date = NOW()
     WHERE id = :count_id
+    AND transaction_id IN (
+        SELECT id FROM audit_transactions 
+        WHERE status = 'draft' 
+        AND created_by_user_id = :user_id
+    )
+    """
+    
+    # ============== CHECK QUERIES ==============
+    
+    CHECK_COUNT_OWNERSHIP = """
+    SELECT acd.id
+    FROM audit_count_details acd
+    JOIN audit_transactions at ON acd.transaction_id = at.id
+    WHERE acd.id = :count_id
+    AND at.created_by_user_id = :user_id
+    AND at.status = 'draft'
+    AND acd.delete_flag = 0
     """

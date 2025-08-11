@@ -31,6 +31,29 @@ auth = AuthManager()
 audit_service = AuditService()
 queries = AuditQueries()
 
+# ============== CACHE WRAPPER FUNCTIONS ==============
+# These wrapper functions enable caching for audit_service methods
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def cached_get_warehouses():
+    """Cached wrapper for get_warehouses"""
+    return audit_service.get_warehouses()
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def cached_get_warehouse_brands(warehouse_id: int):
+    """Cached wrapper for get_warehouse_brands"""
+    return audit_service.get_warehouse_brands(warehouse_id)
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def cached_get_warehouse_products(warehouse_id: int):
+    """Cached wrapper for get_warehouse_products"""
+    return audit_service.get_warehouse_products(warehouse_id)
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def cached_search_products_with_filters(warehouse_id: int, search_term: str = "", brand_filter: str = ""):
+    """Cached wrapper for search_products_with_filters"""
+    return audit_service.search_products_with_filters(warehouse_id, search_term, brand_filter)
+
 # Role permissions
 AUDIT_ROLES = {
     # Executive Level - Full access
@@ -295,12 +318,13 @@ def session_management_page():
     st.subheader("✅ Recent Completed Sessions")
     show_completed_sessions()
 
+
 def create_session_form():
-    """Form to create new audit session"""
+    """Form to create new audit session (with cached warehouse list)"""
     
     # Warehouse selection outside form for real-time updates
     st.markdown("#### 🏢 Select Warehouse")
-    warehouses = audit_service.get_warehouses()
+    warehouses = cached_get_warehouses()  # Using cached version
     
     if not warehouses:
         st.warning("⚠️ No warehouses available")
@@ -620,8 +644,9 @@ def create_transaction_form(session_id: int):
             else:
                 st.warning("⚠️ Please enter transaction name")
 
+
 def show_my_transactions(session_id: int):
-    """Display user's transactions for session"""
+    """Display user's transactions for session with validation"""
     try:
         transactions = audit_service.get_user_transactions(
             session_id, st.session_state.user_id
@@ -648,9 +673,13 @@ def show_my_transactions(session_id: int):
                     with col4:
                         if tx['status'] == 'draft':
                             if st.button("✅ Submit", key=f"submit_{tx['id']}"):
-                                if audit_service.submit_transaction(tx['id'], st.session_state.user_id):
-                                    st.success("Transaction submitted!")
-                                    st.rerun()
+                                # Validation before submit
+                                if tx.get('total_items_counted', 0) > 0:
+                                    if audit_service.submit_transaction(tx['id'], st.session_state.user_id):
+                                        st.success("✅ Transaction submitted successfully!")
+                                        st.rerun()
+                                else:
+                                    st.warning("⚠️ Please count at least one item before submitting")
                     
                     st.markdown("---")
         else:
@@ -658,6 +687,7 @@ def show_my_transactions(session_id: int):
             
     except Exception as e:
         st.error(f"Error loading transactions: {str(e)}")
+
 
 def counting_page():
     """Counting interface page"""
@@ -714,8 +744,8 @@ def product_search_and_count(transaction_id: int):
         # === FILTERS SECTION ===
         st.markdown("##### 🎯 Filters")
         
-        # Brand filter with auto-update
-        brands = audit_service.get_warehouse_brands(warehouse_id)
+        # Brand filter with auto-update (using cached version)
+        brands = cached_get_warehouse_brands(warehouse_id)
         brand_options = ["All Brands"] + [brand['brand'] for brand in brands if brand['brand']]
         selected_brand = st.selectbox(
             "Filter by Brand", 
@@ -727,16 +757,16 @@ def product_search_and_count(transaction_id: int):
         # === PRODUCT SELECTION (Moved up to replace search) ===
         st.markdown("##### 📦 Select Product")
         
-        # Load and filter products automatically based on current brand filter
+        # Load and filter products automatically based on current brand filter (using cached versions)
         try:
             if brand_filter:
                 # Filter by brand only
-                products = audit_service.search_products_with_filters(
+                products = cached_search_products_with_filters(
                     warehouse_id, "", brand_filter
                 )
             else:
                 # Load all products
-                products = audit_service.get_warehouse_products(warehouse_id)
+                products = cached_get_warehouse_products(warehouse_id)
         
             if products:
                 # Create product options for searchable selectbox
@@ -805,6 +835,7 @@ def product_search_and_count(transaction_id: int):
         st.error(f"Error in product search: {str(e)}")
         logger.error(f"Product search error: {e}")
 
+
 def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehouse_id: int):
     """Enhanced product details and counting form with batch details"""
     st.markdown("---")
@@ -872,73 +903,97 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
             except Exception as e:
                 st.caption("ℹ️ Could not load batch details")
                 logger.error(f"Error loading batch details: {e}")
+                batch_details = []
     
-    # Counting form
-    with st.form(f"enhanced_count_form_{product['product_id']}"):
-        st.markdown("#### ✏️ Record Your Count")
+    # BATCH SELECTION OUTSIDE FORM (This is the key!)
+    st.markdown("#### ✏️ Record Your Count")
+    
+    # Variables to store selected batch info
+    selected_batch_no = ""
+    selected_expired_date = None
+    selected_location = ""
+    selected_zone = ""
+    selected_rack = ""
+    selected_bin = ""
+    selected_system_qty = 0
+    selected_system_value = 0
+    
+    # Batch selection dropdown (OUTSIDE the form)
+    if batch_details:
+        batch_options = ["-- Manual Entry --"] + [
+            f"{b['batch_no']} (Qty: {b['quantity']:.0f}, Exp: {b.get('expired_date', 'N/A')})" 
+            for b in batch_details
+        ]
         
-        # Batch selection or manual entry
+        selected_batch_option = st.selectbox(
+            "Quick Select Batch", 
+            batch_options,
+            key=f"batch_selector_{product['product_id']}",
+            help="Select from existing batches or choose manual entry"
+        )
+        
+        # Process selection
+        if selected_batch_option != "-- Manual Entry --":
+            # Extract batch number from selection
+            selected_batch_no_from_option = selected_batch_option.split(" (")[0]
+            
+            # Find the matching batch details
+            for batch in batch_details:
+                if batch['batch_no'] == selected_batch_no_from_option:
+                    selected_batch_no = batch['batch_no']
+                    
+                    # Parse expiry date
+                    if batch.get('expired_date'):
+                        try:
+                            selected_expired_date = pd.to_datetime(batch['expired_date']).date()
+                        except:
+                            selected_expired_date = None
+                    
+                    # Get location info
+                    selected_location = batch.get('location', '')
+                    selected_zone = batch.get('zone_name', '')
+                    selected_rack = batch.get('rack_name', '')
+                    selected_bin = batch.get('bin_name', '')
+                    selected_system_qty = batch.get('quantity', 0)
+                    selected_system_value = batch.get('value_usd', 0)
+                    break
+    
+    # Counting form with pre-populated values
+    with st.form(f"count_form_{product['product_id']}_{selected_batch_no}"):
         col1, col2 = st.columns(2)
         
         with col1:
-            # Quick batch selection if batch details available
-            if batch_details:
-                batch_options = ["-- Manual Entry --"] + [
-                    f"{b['batch_no']} (Qty: {b['quantity']:.0f}, Exp: {b.get('expired_date', 'N/A')})" 
-                    for b in batch_details
-                ]
-                
-                selected_batch = st.selectbox(
-                    "Quick Select Batch", 
-                    batch_options,
-                    help="Select from existing batches or choose manual entry"
+            # Batch number input
+            if selected_batch_no:
+                # Show as disabled when auto-populated
+                st.text_input(
+                    "Batch Number", 
+                    value=selected_batch_no,
+                    disabled=True,
+                    help="Auto-populated from selected batch"
                 )
-                
-                if selected_batch != "-- Manual Entry --":
-                    # Parse selected batch
-                    selected_batch_no = selected_batch.split(" (")[0]
-                    # Find the batch details
-                    selected_batch_info = next(
-                        (b for b in batch_details if b['batch_no'] == selected_batch_no), 
-                        None
-                    )
-                    
-                    if selected_batch_info:
-                        batch_no = st.text_input(
-                            "Batch Number", 
-                            value=selected_batch_info['batch_no'],
-                            disabled=True
-                        )
-                        
-                        # Pre-fill expiry date
-                        if selected_batch_info.get('expired_date'):
-                            try:
-                                exp_date = pd.to_datetime(selected_batch_info['expired_date']).date()
-                                expired_date = st.date_input("Expiry Date", value=exp_date, disabled=True)
-                            except:
-                                expired_date = st.date_input("Expiry Date")
-                        else:
-                            expired_date = st.date_input("Expiry Date")
-                        
-                        # Store for location pre-fill
-                        selected_location = selected_batch_info.get('location', '')
-                else:
-                    # Manual entry
-                    batch_no = st.text_input(
-                        "Batch Number", 
-                        placeholder="Enter batch number found on product"
-                    )
-                    expired_date = st.date_input("Expiry Date")
-                    selected_location = ''
+                batch_no = selected_batch_no  # Store for submission
             else:
-                # No batch details available - manual entry only
                 batch_no = st.text_input(
                     "Batch Number", 
                     placeholder="Enter batch number found on product"
                 )
-                expired_date = st.date_input("Expiry Date")
-                selected_location = ''
             
+            # Expiry date
+            if selected_expired_date:
+                expired_date = st.date_input(
+                    "Expiry Date", 
+                    value=selected_expired_date,
+                    help="Auto-populated from selected batch, edit if needed"
+                )
+            else:
+                expired_date = st.date_input("Expiry Date")
+            
+            # Show system quantity if available
+            if selected_system_qty > 0:
+                st.info(f"📊 System Quantity: {selected_system_qty:.2f}")
+            
+            # Actual quantity input
             actual_quantity = st.number_input(
                 "Actual Quantity Counted*", 
                 min_value=0.0, 
@@ -958,14 +1013,15 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
         
         # Location input based on method
         if location_method == "Quick Location":
-            # Pre-fill location if batch was selected
-            default_location = selected_location if 'selected_location' in locals() and selected_location else ""
+            # Use pre-populated location if available
+            quick_location = st.text_input(
+                "Location", 
+                value=selected_location if selected_location else "",
+                placeholder="e.g., A1-R01-B01 or Cold Storage Area",
+                help="Auto-populated if batch selected, edit if needed"
+            )
             
-            quick_location = st.text_input("Location", 
-                value=default_location,
-                placeholder="e.g., A1-R01-B01 or Cold Storage Area")
-            
-            # Parse quick location
+            # Parse quick location for submission
             if quick_location and '-' in quick_location:
                 parts = quick_location.split('-')
                 zone_name = parts[0].strip() if len(parts) > 0 else ""
@@ -977,52 +1033,56 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
                 bin_name = ""
         else:
             # Detailed location entry
-            # Parse selected location if available
-            if 'selected_location' in locals() and selected_location and '-' in selected_location:
-                parts = selected_location.split('-')
-                default_zone = parts[0].strip() if len(parts) > 0 else ""
-                default_rack = parts[1].strip() if len(parts) > 1 else ""
-                default_bin = parts[2].strip() if len(parts) > 2 else ""
-            else:
-                default_zone = default_rack = default_bin = ""
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                zone_name = st.text_input("Zone", value=default_zone, placeholder="e.g., A1")
-            with col2:
-                rack_name = st.text_input("Rack", value=default_rack, placeholder="e.g., R01")
-            with col3:
-                bin_name = st.text_input("Bin", value=default_bin, placeholder="e.g., B01")
+            col_z, col_r, col_b = st.columns(3)
+            with col_z:
+                zone_name = st.text_input(
+                    "Zone", 
+                    value=selected_zone if selected_zone else "",
+                    placeholder="e.g., A1",
+                    help="Auto-populated if batch selected"
+                )
+            with col_r:
+                rack_name = st.text_input(
+                    "Rack", 
+                    value=selected_rack if selected_rack else "",
+                    placeholder="e.g., R01",
+                    help="Auto-populated if batch selected"
+                )
+            with col_b:
+                bin_name = st.text_input(
+                    "Bin", 
+                    value=selected_bin if selected_bin else "",
+                    placeholder="e.g., B01",
+                    help="Auto-populated if batch selected"
+                )
         
         # Additional notes
-        col1, col2 = st.columns(2)
+        col_note1, col_note2 = st.columns(2)
         
-        with col1:
-            location_notes = st.text_area("Location Notes", 
+        with col_note1:
+            location_notes = st.text_area(
+                "Location Notes", 
                 placeholder="Additional location details...",
-                height=80)
+                height=80
+            )
         
-        with col2:
-            actual_notes = st.text_area("Count Notes", 
+        with col_note2:
+            actual_notes = st.text_area(
+                "Count Notes", 
                 placeholder="Observations about items (damage, expiry, etc.)",
-                height=80)
+                height=80
+            )
         
-        # Submit button with better styling
+        # Submit button
         submit = st.form_submit_button("💾 Save Count", use_container_width=True, type="primary")
         
         if submit:
             if actual_quantity >= 0:
                 try:
-                    # Show loading spinner
                     with st.spinner("Saving count..."):
-                        # Get system quantity for the specific batch if selected
-                        if 'selected_batch_info' in locals() and selected_batch_info:
-                            system_quantity = selected_batch_info.get('quantity', 0)
-                            system_value_usd = selected_batch_info.get('value_usd', 0)
-                        else:
-                            # Use total quantity if no specific batch selected
-                            system_quantity = product.get('total_quantity', 0)
-                            system_value_usd = 0  # Will be calculated later
+                        # Use selected batch values or defaults
+                        system_quantity = selected_system_qty if selected_system_qty > 0 else product.get('total_quantity', 0)
+                        system_value_usd = selected_system_value if selected_system_value > 0 else 0
                         
                         audit_service.save_count_detail({
                             'transaction_id': transaction_id,
@@ -1043,13 +1103,18 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
                     st.success("✅ Count saved successfully!")
                     st.balloons()
                     
-                    # Auto-clear form by rerunning
+                    # Clear cache to ensure fresh data
+                    st.cache_data.clear()
+                    
+                    # Rerun to reset form
                     st.rerun()
                     
                 except Exception as e:
                     st.error(f"❌ Error saving count: {str(e)}")
+                    logger.error(f"Error saving count detail: {e}")
             else:
                 st.warning("⚠️ Please enter a valid quantity (0 or positive number)")
+
 
 def show_product_count_form(transaction_id: int, product: Dict):
     """Show product details and counting form"""

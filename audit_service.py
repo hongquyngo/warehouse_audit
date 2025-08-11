@@ -416,6 +416,32 @@ class AuditService:
             logger.error(f"Error getting recent counts: {e}")
             return []
     
+    def delete_count_detail(self, count_id: int, user_id: int) -> bool:
+        """Delete (soft delete) a count detail"""
+        try:
+            # First check if user owns this count and transaction is still draft
+            check_query = self.queries.CHECK_COUNT_OWNERSHIP
+            check_params = {'count_id': count_id, 'user_id': user_id}
+            
+            result = self._execute_query(check_query, check_params, fetch='one')
+            
+            if not result:
+                logger.warning(f"User {user_id} cannot delete count {count_id} - not owner or not draft")
+                return False
+            
+            # Perform soft delete
+            delete_query = self.queries.SOFT_DELETE_COUNT_DETAIL
+            delete_params = {'count_id': count_id, 'user_id': user_id}
+            
+            self._execute_query(delete_query, delete_params, fetch='none')
+            
+            logger.info(f"Count detail {count_id} deleted by user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting count detail: {e}")
+            return False
+    
     # ============== PRODUCT AND INVENTORY ==============
     
     def get_warehouses(self) -> List[Dict]:
