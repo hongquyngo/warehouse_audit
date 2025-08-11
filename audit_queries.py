@@ -1,4 +1,4 @@
-# audit_queries.py - SQL Queries for Warehouse Audit System
+# audit_queries.py - SQL Queries for Warehouse Audit System with Enhanced Counting
 
 class AuditQueries:
     """Collection of SQL queries for audit system"""
@@ -268,6 +268,93 @@ class AuditQueries:
     LIMIT :limit
     """
     
+    # ============== ENHANCED COUNT TRACKING QUERIES ==============
+    
+    GET_PRODUCT_COUNTS = """
+    SELECT 
+        acd.product_id,
+        acd.batch_no,
+        SUM(acd.actual_quantity) as total_counted,
+        COUNT(*) as count_times,
+        MAX(acd.counted_date) as last_counted,
+        GROUP_CONCAT(DISTINCT acd.zone_name) as zones_counted
+    FROM audit_count_details acd
+    WHERE acd.transaction_id = :transaction_id
+    AND acd.product_id = :product_id
+    AND acd.delete_flag = 0
+    GROUP BY acd.product_id, acd.batch_no
+    """
+    
+    GET_PRODUCT_COUNT_SUMMARY = """
+    SELECT 
+        p.id as product_id,
+        COALESCE(counts.total_counted, 0) as total_counted,
+        COALESCE(counts.count_times, 0) as count_times,
+        COALESCE(counts.unique_batches, 0) as batches_counted
+    FROM products p
+    LEFT JOIN (
+        SELECT 
+            product_id,
+            SUM(actual_quantity) as total_counted,
+            COUNT(*) as count_times,
+            COUNT(DISTINCT batch_no) as unique_batches
+        FROM audit_count_details
+        WHERE transaction_id = :transaction_id
+        AND delete_flag = 0
+        GROUP BY product_id
+    ) counts ON p.id = counts.product_id
+    WHERE p.id = :product_id
+    """
+    
+    GET_TRANSACTION_COUNT_SUMMARY = """
+    SELECT 
+        acd.product_id,
+        p.name as product_name,
+        p.pt_code,
+        COUNT(DISTINCT acd.batch_no) as batches_counted,
+        SUM(acd.actual_quantity) as total_counted,
+        COUNT(*) as count_times,
+        MAX(acd.counted_date) as last_counted
+    FROM audit_count_details acd
+    LEFT JOIN products p ON acd.product_id = p.id
+    WHERE acd.transaction_id = :transaction_id
+    AND acd.delete_flag = 0
+    GROUP BY acd.product_id, p.name, p.pt_code
+    """
+    
+    GET_BATCH_COUNT_STATUS = """
+    SELECT 
+        batch_no,
+        SUM(actual_quantity) as total_counted,
+        COUNT(*) as count_times,
+        MAX(counted_date) as last_counted,
+        GROUP_CONCAT(DISTINCT CONCAT(zone_name, '-', rack_name, '-', bin_name)) as locations_counted
+    FROM audit_count_details
+    WHERE transaction_id = :transaction_id
+    AND product_id = :product_id
+    AND delete_flag = 0
+    GROUP BY batch_no
+    """
+    
+    GET_BATCH_COUNT_HISTORY = """
+    SELECT 
+        acd.id,
+        acd.actual_quantity,
+        acd.counted_date,
+        u.username as counted_by,
+        CONCAT(e.first_name, ' ', e.last_name) as counter_name,
+        acd.actual_notes,
+        CONCAT(acd.zone_name, '-', acd.rack_name, '-', acd.bin_name) as location
+    FROM audit_count_details acd
+    JOIN users u ON acd.created_by_user_id = u.id
+    LEFT JOIN employees e ON u.employee_id = e.id
+    WHERE acd.transaction_id = :transaction_id
+    AND acd.product_id = :product_id
+    AND acd.batch_no = :batch_no
+    AND acd.delete_flag = 0
+    ORDER BY acd.counted_date DESC
+    """
+    
     # ============== PRODUCT AND INVENTORY QUERIES ==============
     
     GET_WAREHOUSES = """
@@ -322,29 +409,6 @@ class AuditQueries:
     AND delete_flag = 0
     """
     
-    SEARCH_PRODUCTS = """
-    SELECT DISTINCT 
-        idv.product_id,
-        idv.product_name,
-        idv.pt_code,
-        idv.legacy_code,
-        idv.brand,
-        idv.package_size,
-        idv.standard_uom,
-        idv.warehouse_name
-    FROM inventory_detailed_view idv
-    WHERE idv.warehouse_id = :warehouse_id
-    AND (
-        idv.pt_code LIKE :search_term 
-        OR idv.legacy_code LIKE :search_term 
-        OR idv.product_name LIKE :search_term
-        OR idv.brand LIKE :search_term
-    )
-    AND idv.remaining_quantity > 0
-    ORDER BY idv.product_name
-    LIMIT 20
-    """
-    
     GET_WAREHOUSE_PRODUCTS = """
     SELECT DISTINCT 
         idv.product_id,
@@ -354,7 +418,7 @@ class AuditQueries:
         idv.brand,
         idv.package_size,
         idv.standard_uom,
-        COUNT(*) as total_batches,
+        COUNT(DISTINCT idv.batch_number) as total_batches,
         SUM(idv.remaining_quantity) as total_quantity
     FROM inventory_detailed_view idv
     WHERE idv.warehouse_id = :warehouse_id
@@ -382,7 +446,7 @@ class AuditQueries:
         idv.brand,
         idv.package_size,
         idv.standard_uom,
-        COUNT(*) as total_batches,
+        COUNT(DISTINCT idv.batch_number) as total_batches,
         SUM(idv.remaining_quantity) as total_quantity
     FROM inventory_detailed_view idv
     WHERE idv.warehouse_id = :warehouse_id
@@ -399,37 +463,10 @@ class AuditQueries:
     LIMIT 100
     """
     
-    GET_PRODUCT_SYSTEM_INVENTORY = """
-    SELECT 
-        idv.product_id,
-        idv.product_name,
-        idv.batch_number as batch_no,
-        idv.expiry_date as expired_date,
-        idv.remaining_quantity as quantity,
-        idv.inventory_value_usd as value_usd,
-        idv.location,
-        SUBSTRING_INDEX(idv.location, '-', 1) as zone_name,
-        CASE 
-            WHEN LOCATE('-', idv.location) > 0 THEN
-                SUBSTRING_INDEX(SUBSTRING_INDEX(idv.location, '-', 2), '-', -1)
-            ELSE ''
-        END as rack_name,
-        CASE 
-            WHEN LENGTH(idv.location) - LENGTH(REPLACE(idv.location, '-', '')) >= 2 THEN
-                SUBSTRING_INDEX(idv.location, '-', -1)
-            ELSE ''
-        END as bin_name
-    FROM inventory_detailed_view idv
-    WHERE idv.warehouse_id = :warehouse_id
-    AND idv.product_id = :product_id
-    AND idv.remaining_quantity > 0
-    ORDER BY idv.expiry_date ASC
-    LIMIT 1
-    """
-    
-    # ============== NEW BATCH DETAILS QUERY ==============
+    # ENHANCED: Get batch details with correct system quantity per batch
     GET_PRODUCT_BATCH_DETAILS = """
     SELECT 
+        idv.inventory_history_id,
         idv.batch_number as batch_no,
         idv.expiry_date as expired_date,
         idv.remaining_quantity as quantity,
@@ -597,43 +634,6 @@ class AuditQueries:
     AND at.delete_flag = 0
     AND (acd.actual_quantity - acd.system_quantity) != 0
     ORDER BY ABS(acd.actual_quantity - acd.system_quantity) DESC
-    """
-    
-    # ============== LOAD SYSTEM INVENTORY QUERY ==============
-    
-    LOAD_SYSTEM_INVENTORY = """
-    INSERT INTO audit_count_details (
-        transaction_id, product_id, batch_no, expired_date,
-        zone_name, rack_name, bin_name,
-        system_quantity, system_value_usd,
-        actual_quantity, 
-        is_new_item, created_by_user_id, created_date
-    )
-    SELECT 
-        :transaction_id as transaction_id,
-        idv.product_id,
-        idv.batch_number as batch_no,
-        idv.expiry_date as expired_date,
-        SUBSTRING_INDEX(idv.location, '-', 1) as zone_name,
-        CASE 
-            WHEN LOCATE('-', idv.location) > 0 THEN
-                SUBSTRING_INDEX(SUBSTRING_INDEX(idv.location, '-', 2), '-', -1)
-            ELSE ''
-        END as rack_name,
-        CASE 
-            WHEN LENGTH(idv.location) - LENGTH(REPLACE(idv.location, '-', '')) >= 2 THEN
-                SUBSTRING_INDEX(idv.location, '-', -1)
-            ELSE ''
-        END as bin_name,
-        idv.remaining_quantity as system_quantity,
-        idv.inventory_value_usd as system_value_usd,
-        0 as actual_quantity,
-        0 as is_new_item,
-        :created_by_user_id,
-        NOW()
-    FROM inventory_detailed_view idv
-    WHERE idv.warehouse_id = :warehouse_id
-    AND idv.remaining_quantity > 0
     """
     
     # ============== UTILITY QUERIES ==============

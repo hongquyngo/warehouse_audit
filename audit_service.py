@@ -1,24 +1,61 @@
-# audit_service.py - Business Logic for Warehouse Audit System
+# audit_service.py - Business Logic for Warehouse Audit System with Enhanced Counting
 import pandas as pd
 from datetime import datetime, date
 from decimal import Decimal
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import logging
 from sqlalchemy import text
+from contextlib import contextmanager
 from utils.db import get_db_engine
 from audit_queries import AuditQueries
 
 logger = logging.getLogger(__name__)
 
+# Custom exceptions
+class AuditException(Exception):
+    """Base exception for audit system"""
+    pass
+
+class SessionNotFoundException(AuditException):
+    """Raised when session not found"""
+    pass
+
+class InvalidTransactionStateException(AuditException):
+    """Raised when transaction is in invalid state for operation"""
+    pass
+
+class CountValidationException(AuditException):
+    """Raised when count data validation fails"""
+    pass
+
 class AuditService:
-    """Service class for audit business logic"""
+    """Service class for audit business logic with enhanced counting"""
     
     def __init__(self):
         self.queries = AuditQueries()
     
-    def _execute_query(self, query: str, params: Dict = None, fetch: str = 'all') -> Any:
-        """Execute database query with error handling"""
+    @contextmanager
+    def _get_db_transaction(self):
+        """Context manager for database transactions"""
+        engine = get_db_engine()
+        conn = engine.connect()
+        trans = conn.begin()
         try:
+            yield conn
+            trans.commit()
+        except Exception:
+            trans.rollback()
+            raise
+        finally:
+            conn.close()
+    
+    def _execute_query(self, query: str, params: Dict = None, fetch: str = 'all', use_transaction: bool = False) -> Any:
+        """Execute database query with error handling and optional transaction"""
+        try:
+            if use_transaction:
+                # Use existing transaction context
+                raise NotImplementedError("Use _get_db_transaction context manager instead")
+            
             engine = get_db_engine()
             with engine.connect() as conn:
                 result = conn.execute(text(query), params or {})
@@ -42,7 +79,7 @@ class AuditService:
             logger.error(f"Database query error: {e}")
             logger.error(f"Query: {query}")
             logger.error(f"Params: {params}")
-            raise e
+            raise AuditException(f"Database error: {str(e)}")
     
     def _convert_decimals(self, data):
         """Convert decimal.Decimal objects to float/int for Streamlit compatibility"""
@@ -87,6 +124,11 @@ class AuditService:
     def create_session(self, session_data: Dict) -> str:
         """Create new audit session"""
         try:
+            # Validate data
+            errors = self.validate_session_data(session_data)
+            if errors:
+                raise CountValidationException(f"Validation errors: {', '.join(errors)}")
+            
             # Generate session code
             session_code = self._generate_code('AUDIT', 'audit_sessions', 'session_code')
             
@@ -114,6 +156,14 @@ class AuditService:
     def start_session(self, session_id: int, user_id: int) -> bool:
         """Start audit session"""
         try:
+            # Check session exists and is in draft status
+            session_info = self.get_session_info(session_id)
+            if not session_info:
+                raise SessionNotFoundException(f"Session {session_id} not found")
+            
+            if session_info['status'] != 'draft':
+                raise InvalidTransactionStateException(f"Session must be in draft status to start")
+            
             query = self.queries.START_SESSION
             params = {
                 'session_id': session_id,
@@ -132,6 +182,14 @@ class AuditService:
     def complete_session(self, session_id: int, user_id: int) -> bool:
         """Complete audit session"""
         try:
+            # Check session exists and is in progress
+            session_info = self.get_session_info(session_id)
+            if not session_info:
+                raise SessionNotFoundException(f"Session {session_id} not found")
+            
+            if session_info['status'] != 'in_progress':
+                raise InvalidTransactionStateException(f"Session must be in progress to complete")
+            
             query = self.queries.COMPLETE_SESSION
             params = {
                 'session_id': session_id,
@@ -214,6 +272,11 @@ class AuditService:
     def create_transaction(self, transaction_data: Dict) -> str:
         """Create new audit transaction"""
         try:
+            # Validate data
+            errors = self.validate_transaction_data(transaction_data)
+            if errors:
+                raise CountValidationException(f"Validation errors: {', '.join(errors)}")
+            
             # Generate transaction code
             transaction_code = self._generate_code('TXN', 'audit_transactions', 'transaction_code')
             
@@ -241,6 +304,19 @@ class AuditService:
     def submit_transaction(self, transaction_id: int, user_id: int) -> bool:
         """Submit transaction for completion"""
         try:
+            # Check transaction exists and has counts
+            tx_info = self.get_transaction_info(transaction_id)
+            if not tx_info:
+                raise InvalidTransactionStateException(f"Transaction {transaction_id} not found")
+            
+            if tx_info['status'] != 'draft':
+                raise InvalidTransactionStateException(f"Transaction must be in draft status to submit")
+            
+            # Check if has counts
+            progress = self.get_transaction_progress(transaction_id)
+            if progress.get('items_counted', 0) == 0:
+                raise CountValidationException("Transaction must have at least one count before submission")
+            
             query = self.queries.SUBMIT_TRANSACTION
             params = {
                 'transaction_id': transaction_id,
@@ -349,6 +425,10 @@ class AuditService:
     def save_count_detail(self, count_data: Dict) -> bool:
         """Save individual count detail"""
         try:
+            # Validate count data
+            if count_data.get('actual_quantity', 0) < 0:
+                raise CountValidationException("Actual quantity cannot be negative")
+            
             # Check if this product already counted in this transaction
             existing_query = self.queries.CHECK_EXISTING_COUNT
             existing_params = {
@@ -404,6 +484,88 @@ class AuditService:
             logger.error(f"Error saving count detail: {e}")
             raise e
     
+    def save_batch_counts(self, count_list: List[Dict]) -> Tuple[int, List[str]]:
+        """Save multiple counts in a single transaction"""
+        saved_count = 0
+        errors = []
+        
+        try:
+            with self._get_db_transaction() as conn:
+                for i, count_data in enumerate(count_list):
+                    try:
+                        # Validate each count
+                        if count_data.get('actual_quantity', 0) < 0:
+                            errors.append(f"Row {i+1}: Actual quantity cannot be negative")
+                            continue
+                        
+                        # Check existing
+                        existing_query = self.queries.CHECK_EXISTING_COUNT
+                        existing_params = {
+                            'transaction_id': count_data['transaction_id'],
+                            'product_id': count_data.get('product_id'),
+                            'batch_no': count_data.get('batch_no', ''),
+                            'is_new_item': count_data.get('is_new_item', False)
+                        }
+                        
+                        result = conn.execute(text(existing_query), existing_params)
+                        existing = result.fetchone()
+                        
+                        if existing:
+                            # Update existing
+                            update_query = self.queries.UPDATE_COUNT_DETAIL
+                            update_params = {
+                                'count_id': existing.id,
+                                'actual_quantity': count_data['actual_quantity'],
+                                'actual_notes': count_data.get('actual_notes', ''),
+                                'zone_name': count_data.get('zone_name', ''),
+                                'rack_name': count_data.get('rack_name', ''),
+                                'bin_name': count_data.get('bin_name', ''),
+                                'location_notes': count_data.get('location_notes', ''),
+                                'modified_by_user_id': count_data['created_by_user_id'],
+                                'modified_date': datetime.now()
+                            }
+                            conn.execute(text(update_query), update_params)
+                        else:
+                            # Insert new
+                            insert_query = self.queries.INSERT_COUNT_DETAIL
+                            insert_params = {
+                                'transaction_id': count_data['transaction_id'],
+                                'product_id': count_data.get('product_id'),
+                                'batch_no': count_data.get('batch_no', ''),
+                                'expired_date': count_data.get('expired_date'),
+                                'zone_name': count_data.get('zone_name', ''),
+                                'rack_name': count_data.get('rack_name', ''),
+                                'bin_name': count_data.get('bin_name', ''),
+                                'location_notes': count_data.get('location_notes', ''),
+                                'system_quantity': count_data.get('system_quantity', 0),
+                                'system_value_usd': count_data.get('system_value_usd', 0),
+                                'actual_quantity': count_data['actual_quantity'],
+                                'actual_notes': count_data.get('actual_notes', ''),
+                                'is_new_item': count_data.get('is_new_item', False),
+                                'created_by_user_id': count_data['created_by_user_id'],
+                                'counted_date': datetime.now()
+                            }
+                            conn.execute(text(insert_query), insert_params)
+                        
+                        saved_count += 1
+                        
+                    except Exception as e:
+                        errors.append(f"Row {i+1}: {str(e)}")
+                        continue
+                
+                # Update transaction counts if any saved
+                if saved_count > 0 and count_list:
+                    transaction_id = count_list[0]['transaction_id']
+                    update_query = self.queries.UPDATE_TRANSACTION_COUNTS
+                    conn.execute(text(update_query), {'transaction_id': transaction_id})
+            
+            logger.info(f"Batch save completed: {saved_count} saved, {len(errors)} errors")
+            return saved_count, errors
+            
+        except Exception as e:
+            logger.error(f"Error in batch save: {e}")
+            raise e
+    
     def get_recent_counts(self, transaction_id: int, limit: int = 10) -> List[Dict]:
         """Get recent counts for transaction"""
         try:
@@ -441,6 +603,88 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error deleting count detail: {e}")
             return False
+    
+    # ============== ENHANCED COUNT TRACKING ==============
+    
+    def get_product_counts(self, transaction_id: int, product_id: int) -> List[Dict]:
+        """Get all counts for a product in transaction"""
+        try:
+            query = self.queries.GET_PRODUCT_COUNTS
+            params = {
+                'transaction_id': transaction_id,
+                'product_id': product_id
+            }
+            return self._execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting product counts: {e}")
+            return []
+    
+    def get_product_count_summary(self, transaction_id: int, product_id: int) -> Dict:
+        """Get count summary for a specific product"""
+        try:
+            query = self.queries.GET_PRODUCT_COUNT_SUMMARY
+            params = {
+                'transaction_id': transaction_id,
+                'product_id': product_id
+            }
+            
+            result = self._execute_query(query, params, fetch='one')
+            return result or {
+                'product_id': product_id,
+                'total_counted': 0,
+                'count_times': 0,
+                'batches_counted': 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting product count summary: {e}")
+            return {
+                'product_id': product_id,
+                'total_counted': 0,
+                'count_times': 0,
+                'batches_counted': 0
+            }
+    
+    def get_transaction_count_summary(self, transaction_id: int) -> List[Dict]:
+        """Get count summary for all products in transaction"""
+        try:
+            query = self.queries.GET_TRANSACTION_COUNT_SUMMARY
+            params = {'transaction_id': transaction_id}
+            return self._execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting transaction count summary: {e}")
+            return []
+    
+    def get_batch_count_status(self, transaction_id: int, product_id: int) -> List[Dict]:
+        """Get count status for each batch"""
+        try:
+            query = self.queries.GET_BATCH_COUNT_STATUS
+            params = {
+                'transaction_id': transaction_id,
+                'product_id': product_id
+            }
+            return self._execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting batch count status: {e}")
+            return []
+    
+    def get_batch_count_history(self, transaction_id: int, product_id: int, batch_no: str) -> List[Dict]:
+        """Get count history for a specific batch"""
+        try:
+            query = self.queries.GET_BATCH_COUNT_HISTORY
+            params = {
+                'transaction_id': transaction_id,
+                'product_id': product_id,
+                'batch_no': batch_no
+            }
+            return self._execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting batch count history: {e}")
+            return []
     
     # ============== PRODUCT AND INVENTORY ==============
     
@@ -493,45 +737,7 @@ class AuditService:
             
         except Exception as e:
             logger.error(f"Error getting warehouse detail: {e}")
-            # Try basic query as last resort
-            try:
-                basic_query = self.queries.GET_WAREHOUSE_BASIC
-                params = {'warehouse_id': warehouse_id}
-                basic_result = self._execute_query(basic_query, params, fetch='one')
-                
-                if basic_result:
-                    return {
-                        'id': basic_result.get('id'),
-                        'name': basic_result.get('name'),
-                        'address': basic_result.get('address'),
-                        'zipcode': basic_result.get('zipcode'),
-                        'company_name': 'Basic info only',
-                        'company_local_name': 'N/A',
-                        'country_name': 'N/A',
-                        'state_province': 'N/A',
-                        'manager_name': 'N/A',
-                        'manager_email': 'N/A'
-                    }
-                    
-            except Exception as e2:
-                logger.error(f"Basic warehouse query also failed: {e2}")
-            
             return {}
-    
-    def search_products(self, search_term: str, warehouse_id: int) -> List[Dict]:
-        """Search products in warehouse (legacy method for backward compatibility)"""
-        try:
-            query = self.queries.SEARCH_PRODUCTS
-            params = {
-                'warehouse_id': warehouse_id,
-                'search_term': f"%{search_term}%"
-            }
-            
-            return self._execute_query(query, params)
-            
-        except Exception as e:
-            logger.error(f"Error searching products: {e}")
-            return []
     
     def get_warehouse_products(self, warehouse_id: int) -> List[Dict]:
         """Get all products available in warehouse"""
@@ -572,26 +778,6 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error searching products with filters: {e}")
             return []
-    
-    def get_product_system_inventory(self, transaction_id: int, product_id: int) -> Dict:
-        """Get system inventory for product in transaction context"""
-        try:
-            # First get session and warehouse info
-            tx_info = self.get_transaction_info(transaction_id)
-            session_info = self.get_session_info(tx_info['session_id'])
-            warehouse_id = session_info['warehouse_id']
-            
-            query = self.queries.GET_PRODUCT_SYSTEM_INVENTORY
-            params = {
-                'warehouse_id': warehouse_id,
-                'product_id': product_id
-            }
-            
-            return self._execute_query(query, params, fetch='one')
-            
-        except Exception as e:
-            logger.error(f"Error getting product system inventory: {e}")
-            return {}
     
     def get_product_batch_details(self, warehouse_id: int, product_id: int) -> List[Dict]:
         """Get all batch details for a product in warehouse"""
@@ -669,6 +855,18 @@ class AuditService:
             logger.error(f"Error getting session report data: {e}")
             return []
     
+    def get_variance_analysis(self, session_id: int) -> List[Dict]:
+        """Get variance analysis for session"""
+        try:
+            query = self.queries.GET_VARIANCE_ANALYSIS
+            params = {'session_id': session_id}
+            
+            return self._execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting variance analysis: {e}")
+            return []
+    
     def export_session_to_excel(self, session_id: int, file_path: str = None) -> str:
         """Export session data to Excel file"""
         try:
@@ -677,7 +875,7 @@ class AuditService:
             report_data = self.get_session_report_data(session_id)
             
             if not report_data:
-                raise Exception("No data available for export")
+                raise AuditException("No data available for export")
             
             # Create DataFrame
             df = pd.DataFrame(report_data)
@@ -712,6 +910,12 @@ class AuditService:
                 
                 summary_df = pd.DataFrame(summary_data)
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Variance analysis sheet
+                variance_data = self.get_variance_analysis(session_id)
+                if variance_data:
+                    variance_df = pd.DataFrame(variance_data)
+                    variance_df.to_excel(writer, sheet_name='Variance_Analysis', index=False)
             
             logger.info(f"Session {session_id} exported to {file_path}")
             return file_path
@@ -773,21 +977,17 @@ class AuditService:
         try:
             session_info = self.get_session_info(session_id)
             session_progress = self.get_session_progress(session_id)
-            
-            # Get variance analysis
-            variance_query = self.queries.GET_VARIANCE_ANALYSIS
-            variance_params = {'session_id': session_id}
-            variance_data = self._execute_query(variance_query, variance_params)
+            variance_data = self.get_variance_analysis(session_id)
             
             # Calculate summary metrics
-            total_variance = sum(item.get('variance_value', 0) for item in variance_data)
+            total_variance_value = sum(item.get('variance_value', 0) for item in variance_data)
             items_with_variance = len([item for item in variance_data if item.get('variance_quantity', 0) != 0])
             
             return {
                 'session_info': session_info,
                 'progress': session_progress,
                 'variance_summary': {
-                    'total_variance_usd': total_variance,
+                    'total_variance_usd': total_variance_value,
                     'items_with_variance': items_with_variance,
                     'variance_items': variance_data[:10]  # Top 10 variance items
                 }
