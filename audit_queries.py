@@ -427,6 +427,32 @@ class AuditQueries:
     LIMIT 1
     """
     
+    # ============== NEW BATCH DETAILS QUERY ==============
+    GET_PRODUCT_BATCH_DETAILS = """
+    SELECT 
+        idv.batch_number as batch_no,
+        idv.expiry_date as expired_date,
+        idv.remaining_quantity as quantity,
+        idv.location,
+        idv.inventory_value_usd as value_usd,
+        SUBSTRING_INDEX(idv.location, '-', 1) as zone_name,
+        CASE 
+            WHEN LOCATE('-', idv.location) > 0 THEN
+                SUBSTRING_INDEX(SUBSTRING_INDEX(idv.location, '-', 2), '-', -1)
+            ELSE ''
+        END as rack_name,
+        CASE 
+            WHEN LENGTH(idv.location) - LENGTH(REPLACE(idv.location, '-', '')) >= 2 THEN
+                SUBSTRING_INDEX(idv.location, '-', -1)
+            ELSE ''
+        END as bin_name
+    FROM inventory_detailed_view idv
+    WHERE idv.warehouse_id = :warehouse_id
+    AND idv.product_id = :product_id
+    AND idv.remaining_quantity > 0
+    ORDER BY idv.expiry_date ASC
+    """
+    
     # ============== DASHBOARD AND STATS QUERIES ==============
     
     GET_DASHBOARD_STATS = """

@@ -492,18 +492,6 @@ class AuditService:
             
             return {}
     
-    def get_warehouse_detail(self, warehouse_id: int) -> Dict:
-        """Get detailed warehouse information"""
-        try:
-            query = self.queries.GET_WAREHOUSE_DETAIL
-            params = {'warehouse_id': warehouse_id}
-            
-            return self._execute_query(query, params, fetch='one')
-            
-        except Exception as e:
-            logger.error(f"Error getting warehouse detail: {e}")
-            return {}
-    
     def search_products(self, search_term: str, warehouse_id: int) -> List[Dict]:
         """Search products in warehouse (legacy method for backward compatibility)"""
         try:
@@ -578,6 +566,21 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error getting product system inventory: {e}")
             return {}
+    
+    def get_product_batch_details(self, warehouse_id: int, product_id: int) -> List[Dict]:
+        """Get all batch details for a product in warehouse"""
+        try:
+            query = self.queries.GET_PRODUCT_BATCH_DETAILS
+            params = {
+                'warehouse_id': warehouse_id,
+                'product_id': product_id
+            }
+            
+            return self._execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error getting product batch details: {e}")
+            return []
     
     # ============== DASHBOARD AND STATS ==============
     

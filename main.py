@@ -806,7 +806,7 @@ def product_search_and_count(transaction_id: int):
         logger.error(f"Product search error: {e}")
 
 def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehouse_id: int):
-    """Enhanced product details and counting form"""
+    """Enhanced product details and counting form with batch details"""
     st.markdown("---")
     st.markdown("#### 📦 Product Details & Counting")
     
@@ -828,30 +828,116 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
             st.write(f"**Total Batches:** {product.get('total_batches', 0)}")
             st.write(f"**Total System Qty:** {product.get('total_quantity', 0):.2f}")
             
-            # Get specific batch info if available
+            # Get batch details
             try:
-                system_inventory = audit_service.get_product_system_inventory(
-                    transaction_id, product['product_id']
+                batch_details = audit_service.get_product_batch_details(
+                    warehouse_id, product['product_id']
                 )
                 
-                if system_inventory:
-                    st.write(f"**Latest Batch:** {system_inventory.get('batch_no', 'N/A')}")
-                    st.write(f"**Expiry Date:** {system_inventory.get('expired_date', 'N/A')}")
-                    st.write(f"**Location:** {system_inventory.get('location', 'N/A')}")
+                if batch_details:
+                    # Show batch details in expandable section
+                    with st.expander(f"📋 View All {len(batch_details)} Batches", expanded=True):
+                        for i, batch in enumerate(batch_details):
+                            # Create a compact batch info display
+                            batch_col1, batch_col2, batch_col3 = st.columns([2, 1, 2])
+                            
+                            with batch_col1:
+                                st.markdown(f"**Batch:** {batch.get('batch_no', 'N/A')}")
+                                exp_date = batch.get('expired_date', 'N/A')
+                                if exp_date != 'N/A':
+                                    # Check if expired
+                                    try:
+                                        exp_date_obj = pd.to_datetime(exp_date).date()
+                                        if exp_date_obj < date.today():
+                                            st.caption(f"🔴 Expired: {exp_date}")
+                                        elif exp_date_obj < date.today() + pd.Timedelta(days=90):
+                                            st.caption(f"🟡 Expires: {exp_date}")
+                                        else:
+                                            st.caption(f"🟢 Expires: {exp_date}")
+                                    except:
+                                        st.caption(f"Expires: {exp_date}")
+                            
+                            with batch_col2:
+                                st.metric("Qty", f"{batch.get('quantity', 0):.2f}")
+                            
+                            with batch_col3:
+                                location = batch.get('location', 'N/A')
+                                st.write(f"📍 {location}")
+                            
+                            if i < len(batch_details) - 1:
+                                st.markdown("---")
                 else:
-                    st.caption("ℹ️ No specific batch details available")
+                    st.caption("ℹ️ No batch details available")
+                    
             except Exception as e:
-                st.caption("ℹ️ Could not load detailed batch info")
+                st.caption("ℹ️ Could not load batch details")
+                logger.error(f"Error loading batch details: {e}")
     
     # Counting form
     with st.form(f"enhanced_count_form_{product['product_id']}"):
         st.markdown("#### ✏️ Record Your Count")
         
+        # Batch selection or manual entry
         col1, col2 = st.columns(2)
         
         with col1:
-            batch_no = st.text_input("Batch Number", 
-                placeholder="Enter batch number found on product")
+            # Quick batch selection if batch details available
+            if batch_details:
+                batch_options = ["-- Manual Entry --"] + [
+                    f"{b['batch_no']} (Qty: {b['quantity']:.0f}, Exp: {b.get('expired_date', 'N/A')})" 
+                    for b in batch_details
+                ]
+                
+                selected_batch = st.selectbox(
+                    "Quick Select Batch", 
+                    batch_options,
+                    help="Select from existing batches or choose manual entry"
+                )
+                
+                if selected_batch != "-- Manual Entry --":
+                    # Parse selected batch
+                    selected_batch_no = selected_batch.split(" (")[0]
+                    # Find the batch details
+                    selected_batch_info = next(
+                        (b for b in batch_details if b['batch_no'] == selected_batch_no), 
+                        None
+                    )
+                    
+                    if selected_batch_info:
+                        batch_no = st.text_input(
+                            "Batch Number", 
+                            value=selected_batch_info['batch_no'],
+                            disabled=True
+                        )
+                        
+                        # Pre-fill expiry date
+                        if selected_batch_info.get('expired_date'):
+                            try:
+                                exp_date = pd.to_datetime(selected_batch_info['expired_date']).date()
+                                expired_date = st.date_input("Expiry Date", value=exp_date, disabled=True)
+                            except:
+                                expired_date = st.date_input("Expiry Date")
+                        else:
+                            expired_date = st.date_input("Expiry Date")
+                        
+                        # Store for location pre-fill
+                        selected_location = selected_batch_info.get('location', '')
+                else:
+                    # Manual entry
+                    batch_no = st.text_input(
+                        "Batch Number", 
+                        placeholder="Enter batch number found on product"
+                    )
+                    expired_date = st.date_input("Expiry Date")
+                    selected_location = ''
+            else:
+                # No batch details available - manual entry only
+                batch_no = st.text_input(
+                    "Batch Number", 
+                    placeholder="Enter batch number found on product"
+                )
+                expired_date = st.date_input("Expiry Date")
+                selected_location = ''
             
             actual_quantity = st.number_input(
                 "Actual Quantity Counted*", 
@@ -862,9 +948,6 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
             )
         
         with col2:
-            expired_date = st.date_input("Expiry Date",
-                help="Expiry date found on the product")
-            
             # Location method selection
             location_method = st.radio(
                 "Location Entry:",
@@ -875,7 +958,11 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
         
         # Location input based on method
         if location_method == "Quick Location":
+            # Pre-fill location if batch was selected
+            default_location = selected_location if 'selected_location' in locals() and selected_location else ""
+            
             quick_location = st.text_input("Location", 
+                value=default_location,
                 placeholder="e.g., A1-R01-B01 or Cold Storage Area")
             
             # Parse quick location
@@ -890,13 +977,22 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
                 bin_name = ""
         else:
             # Detailed location entry
+            # Parse selected location if available
+            if 'selected_location' in locals() and selected_location and '-' in selected_location:
+                parts = selected_location.split('-')
+                default_zone = parts[0].strip() if len(parts) > 0 else ""
+                default_rack = parts[1].strip() if len(parts) > 1 else ""
+                default_bin = parts[2].strip() if len(parts) > 2 else ""
+            else:
+                default_zone = default_rack = default_bin = ""
+            
             col1, col2, col3 = st.columns(3)
             with col1:
-                zone_name = st.text_input("Zone", placeholder="e.g., A1")
+                zone_name = st.text_input("Zone", value=default_zone, placeholder="e.g., A1")
             with col2:
-                rack_name = st.text_input("Rack", placeholder="e.g., R01")
+                rack_name = st.text_input("Rack", value=default_rack, placeholder="e.g., R01")
             with col3:
-                bin_name = st.text_input("Bin", placeholder="e.g., B01")
+                bin_name = st.text_input("Bin", value=default_bin, placeholder="e.g., B01")
         
         # Additional notes
         col1, col2 = st.columns(2)
@@ -919,6 +1015,15 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
                 try:
                     # Show loading spinner
                     with st.spinner("Saving count..."):
+                        # Get system quantity for the specific batch if selected
+                        if 'selected_batch_info' in locals() and selected_batch_info:
+                            system_quantity = selected_batch_info.get('quantity', 0)
+                            system_value_usd = selected_batch_info.get('value_usd', 0)
+                        else:
+                            # Use total quantity if no specific batch selected
+                            system_quantity = product.get('total_quantity', 0)
+                            system_value_usd = 0  # Will be calculated later
+                        
                         audit_service.save_count_detail({
                             'transaction_id': transaction_id,
                             'product_id': product['product_id'],
@@ -928,8 +1033,8 @@ def show_enhanced_product_count_form(transaction_id: int, product: Dict, warehou
                             'rack_name': rack_name,
                             'bin_name': bin_name,
                             'location_notes': location_notes,
-                            'system_quantity': product.get('total_quantity', 0),
-                            'system_value_usd': 0,  # Will be calculated later
+                            'system_quantity': system_quantity,
+                            'system_value_usd': system_value_usd,
                             'actual_quantity': actual_quantity,
                             'actual_notes': actual_notes,
                             'created_by_user_id': st.session_state.user_id
