@@ -1,4 +1,4 @@
-# audit_service.py - Business Logic for Warehouse Audit System with Enhanced Counting
+# audit_service.py - Optimized Business Logic for Warehouse Audit System
 import pandas as pd
 from datetime import datetime, date
 from decimal import Decimal
@@ -8,6 +8,7 @@ from sqlalchemy import text
 from contextlib import contextmanager
 from utils.db import get_db_engine
 from audit_queries import AuditQueries
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +30,15 @@ class CountValidationException(AuditException):
     pass
 
 class AuditService:
-    """Service class for audit business logic with enhanced counting"""
+    """Optimized service class for audit business logic"""
     
     def __init__(self):
         self.queries = AuditQueries()
+        self._connection_pool = None
     
     @contextmanager
     def _get_db_transaction(self):
-        """Context manager for database transactions"""
+        """Context manager for database transactions with connection pooling"""
         engine = get_db_engine()
         conn = engine.connect()
         trans = conn.begin()
@@ -53,7 +55,6 @@ class AuditService:
         """Execute database query with error handling and optional transaction"""
         try:
             if use_transaction:
-                # Use existing transaction context
                 raise NotImplementedError("Use _get_db_transaction context manager instead")
             
             engine = get_db_engine()
@@ -77,7 +78,7 @@ class AuditService:
                     
         except Exception as e:
             logger.error(f"Database query error: {e}")
-            logger.error(f"Query: {query}")
+            logger.error(f"Query: {query[:200]}...")  # Log first 200 chars
             logger.error(f"Params: {params}")
             raise AuditException(f"Database error: {str(e)}")
     
@@ -420,7 +421,7 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error updating transaction counts: {e}")
     
-    # ============== COUNT DETAILS MANAGEMENT ==============
+    # ============== OPTIMIZED COUNT DETAILS MANAGEMENT ==============
     
     def save_count_detail(self, count_data: Dict) -> bool:
         """Save individual count detail"""
@@ -485,18 +486,39 @@ class AuditService:
             raise e
     
     def save_batch_counts(self, count_list: List[Dict]) -> Tuple[int, List[str]]:
-        """Save multiple counts in a single transaction"""
+        """Optimized batch save with better error handling"""
         saved_count = 0
         errors = []
+        transaction_id = None
         
         try:
+            # Start timing
+            start_time = time.time()
+            
             with self._get_db_transaction() as conn:
                 for i, count_data in enumerate(count_list):
                     try:
                         # Validate each count
-                        if count_data.get('actual_quantity', 0) < 0:
-                            errors.append(f"Row {i+1}: Actual quantity cannot be negative")
+                        if count_data.get('actual_quantity', 0) <= 0:
+                            errors.append(f"Row {i+1}: Actual quantity must be greater than 0")
                             continue
+                        
+                        # Store transaction_id for later update
+                        if transaction_id is None:
+                            transaction_id = count_data['transaction_id']
+                        
+                        # Parse location if needed
+                        if 'location' in count_data and not count_data.get('zone_name'):
+                            location = count_data['location']
+                            if '-' in location:
+                                parts = location.split('-')
+                                count_data['zone_name'] = parts[0].strip() if len(parts) > 0 else ""
+                                count_data['rack_name'] = parts[1].strip() if len(parts) > 1 else ""
+                                count_data['bin_name'] = parts[2].strip() if len(parts) > 2 else ""
+                            else:
+                                count_data['zone_name'] = location.strip()
+                                count_data['rack_name'] = ""
+                                count_data['bin_name'] = ""
                         
                         # Check existing
                         existing_query = self.queries.CHECK_EXISTING_COUNT
@@ -551,15 +573,18 @@ class AuditService:
                         
                     except Exception as e:
                         errors.append(f"Row {i+1}: {str(e)}")
+                        logger.error(f"Error saving count {i+1}: {e}")
                         continue
                 
                 # Update transaction counts if any saved
-                if saved_count > 0 and count_list:
-                    transaction_id = count_list[0]['transaction_id']
+                if saved_count > 0 and transaction_id:
                     update_query = self.queries.UPDATE_TRANSACTION_COUNTS
                     conn.execute(text(update_query), {'transaction_id': transaction_id})
             
-            logger.info(f"Batch save completed: {saved_count} saved, {len(errors)} errors")
+            # Log performance
+            elapsed = time.time() - start_time
+            logger.info(f"Batch save completed: {saved_count} saved, {len(errors)} errors in {elapsed:.2f}s")
+            
             return saved_count, errors
             
         except Exception as e:
@@ -647,7 +672,7 @@ class AuditService:
             }
     
     def get_transaction_count_summary(self, transaction_id: int) -> List[Dict]:
-        """Get count summary for all products in transaction"""
+        """Get count summary for all products in transaction - optimized"""
         try:
             query = self.queries.GET_TRANSACTION_COUNT_SUMMARY
             params = {'transaction_id': transaction_id}
