@@ -1,0 +1,53 @@
+# Core Framework
+streamlit
+streamlit-option-menu
+
+# Data Processing
+pandas
+numpy
+openpyxl
+xlsxwriter
+python-dateutil
+
+# Database
+sqlalchemy
+pymysql
+cryptography # Required for pymysql
+
+# Visualization
+altair
+plotly
+matplotlib
+seaborn
+
+# Authentication & Security
+bcrypt
+python-jose[cryptography] # For JWT
+streamlit-authenticator # Optional, or build custom
+
+# Caching & Performance
+cachetools
+streamlit-aggrid # Advanced tables
+redis==5.0.1  # Optional for external caching
+
+# Export & Reporting
+reportlab # PDF generation
+python-pptx # PowerPoint
+Pillow # Image processing
+jinja2  # Template engine
+
+# Utilities
+python-dotenv
+pytz
+requests
+pyyaml
+
+# Development Tools (Optional)
+black  # Code formatting
+flake8  # Linting
+pytest  # Testing
+pytest-cov  # Test coverage
+
+# Monitoring & Logging (Optional)
+loguru  # Better logging
+sentry-sdk  # Error tracking
