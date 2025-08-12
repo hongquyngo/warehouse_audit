@@ -1,20 +1,19 @@
-# main.py - Warehouse Audit System with Optimized Counting Tab
+# main_new_item_optimized.py - Optimized New Item Management for Warehouse Audit
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
 import json
-from functools import partial
 
 # Import existing utilities
 from utils.auth import AuthManager
 from utils.config import config
 from utils.db import get_db_engine
 
-# Import our services
-from audit_service import AuditService, AuditException, SessionNotFoundException, InvalidTransactionStateException, CountValidationException
+# Import services
+from audit_service import AuditService, AuditException
 from audit_queries import AuditQueries
 
 # Setup logging
@@ -23,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 # Page config
 st.set_page_config(
-    page_title="Warehouse Audit System",
-    page_icon="🏭",
+    page_title="New Item Management - Warehouse Audit",
+    page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -32,1045 +31,727 @@ st.set_page_config(
 # Initialize services
 auth = AuthManager()
 audit_service = AuditService()
-queries = AuditQueries()
 
 # ============== SESSION STATE INITIALIZATION ==============
-
 def init_session_state():
-    """Initialize all session state variables for optimized performance"""
-    defaults = {
-        # Counting specific
-        'temp_counts': [],
-        'count_counter': 0,
-        'selected_product_data': None,
-        'selected_batch_data': None,
-        'form_values': {},
-        'show_count_history': {},
-        'last_action': None,
-        'last_action_time': None,
-        
-        # Form field values
-        'batch_no_input': '',
-        'actual_qty_input': 0.0,
-        'location_input': '',
-        'notes_input': '',
-        'expiry_date_input': None,
-        
-        # Cache management
-        'cached_products': None,
-        'cached_batches': {},
-        'cached_transactions': None,
-        'cached_count_summaries': {},
-        'cache_timestamp': {},
-        
-        # UI state
-        'counting_mode': 'fast',  # 'fast' or 'detailed'
-        'show_batch_details': True,
-        'auto_save_enabled': False,
-        'auto_save_threshold': 10,
-        
-        # Performance tracking
-        'action_count': 0,
-        'last_refresh_time': datetime.now()
-    }
+    """Initialize all session state variables"""
+    if 'new_items_list' not in st.session_state:
+        st.session_state.new_items_list = []
     
-    for key, default_value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = default_value
-
-# Call init at startup
-init_session_state()
-
-# ============== CACHE FUNCTIONS WITH TTL ==============
-
-@st.cache_data(ttl=3600)  # 1 hour cache
-def cached_get_warehouses():
-    """Cached wrapper for get_warehouses"""
-    return audit_service.get_warehouses()
-
-@st.cache_data(ttl=1800)  # 30 minutes cache
-def cached_get_warehouse_brands(warehouse_id: int):
-    """Cached wrapper for get_warehouse_brands"""
-    return audit_service.get_warehouse_brands(warehouse_id)
-
-@st.cache_data(ttl=900)  # 15 minutes cache
-def cached_get_warehouse_products(warehouse_id: int):
-    """Cached wrapper for get_warehouse_products"""
-    return audit_service.get_warehouse_products(warehouse_id)
-
-@st.cache_data(ttl=600)  # 10 minutes cache
-def cached_search_products_with_filters(warehouse_id: int, search_term: str = "", brand_filter: str = ""):
-    """Cached wrapper for search_products_with_filters"""
-    return audit_service.search_products_with_filters(warehouse_id, search_term, brand_filter)
-
-# ============== OPTIMIZED TEMP COUNT MANAGEMENT ==============
-
-def add_temp_count_optimized(count_data: Dict):
-    """Add count to temporary storage without rerun"""
-    st.session_state.temp_counts.append(count_data)
-    st.session_state.count_counter += 1
-    st.session_state.last_action = f"✅ Added count #{len(st.session_state.temp_counts)}"
-    st.session_state.last_action_time = datetime.now()
+    if 'item_counter' not in st.session_state:
+        st.session_state.item_counter = 0
     
-    # Auto-save check
-    if st.session_state.auto_save_enabled and len(st.session_state.temp_counts) >= st.session_state.auto_save_threshold:
-        return True  # Signal to save
-    return False
-
-def remove_temp_count(index: int):
-    """Remove count from temporary storage"""
-    if 0 <= index < len(st.session_state.temp_counts):
-        removed = st.session_state.temp_counts.pop(index)
-        st.session_state.last_action = f"🗑️ Removed count for {removed['product_name']}"
-        st.session_state.last_action_time = datetime.now()
-
-def clear_temp_counts():
-    """Clear temporary counts after saving"""
-    count = len(st.session_state.temp_counts)
-    st.session_state.temp_counts = []
-    st.session_state.count_counter = 0
-    st.session_state.last_action = f"🗑️ Cleared {count} counts"
-    st.session_state.last_action_time = datetime.now()
-
-def get_temp_counts_summary() -> Dict:
-    """Get summary of temporary counts"""
-    if not st.session_state.temp_counts:
-        return {'total': 0, 'products': 0, 'quantity': 0}
+    if 'last_save_time' not in st.session_state:
+        st.session_state.last_save_time = None
     
-    product_ids = set()
-    total_quantity = 0
+    if 'show_preview' not in st.session_state:
+        st.session_state.show_preview = True
     
-    for count in st.session_state.temp_counts:
-        if count.get('product_id'):
-            product_ids.add(count['product_id'])
-        total_quantity += count.get('actual_quantity', 0)
+    if 'quick_entry_mode' not in st.session_state:
+        st.session_state.quick_entry_mode = True
+    
+    if 'default_location' not in st.session_state:
+        st.session_state.default_location = {'zone': '', 'rack': '', 'bin': ''}
+    
+    if 'form_data' not in st.session_state:
+        st.session_state.form_data = {}
+
+# ============== ITEM MANAGEMENT FUNCTIONS ==============
+
+def add_new_item(item_data: Dict):
+    """Add item to list with validation"""
+    # Validate required fields
+    if not item_data.get('product_name'):
+        raise ValueError("Product name is required")
+    
+    if item_data.get('actual_quantity', 0) <= 0:
+        raise ValueError("Quantity must be greater than 0")
+    
+    # Add metadata
+    item_data['temp_id'] = f"new_{st.session_state.item_counter}_{int(time.time() * 1000)}"
+    item_data['added_time'] = datetime.now()
+    
+    # Add to list
+    st.session_state.new_items_list.append(item_data)
+    st.session_state.item_counter += 1
+    
+    return item_data['temp_id']
+
+def remove_item(temp_id: str):
+    """Remove item from list"""
+    st.session_state.new_items_list = [
+        item for item in st.session_state.new_items_list 
+        if item.get('temp_id') != temp_id
+    ]
+
+def clear_all_items():
+    """Clear all items from list"""
+    st.session_state.new_items_list = []
+    st.session_state.item_counter = 0
+
+def get_items_summary() -> Dict:
+    """Get summary statistics"""
+    if not st.session_state.new_items_list:
+        return {
+            'total_items': 0,
+            'total_quantity': 0,
+            'unique_products': 0,
+            'total_batches': 0
+        }
+    
+    total_quantity = sum(item.get('actual_quantity', 0) for item in st.session_state.new_items_list)
+    unique_products = len(set(item.get('product_name', '').upper() for item in st.session_state.new_items_list))
+    total_batches = len(set((item.get('product_name', ''), item.get('batch_no', '')) 
+                           for item in st.session_state.new_items_list))
     
     return {
-        'total': len(st.session_state.temp_counts),
-        'products': len(product_ids),
-        'quantity': total_quantity
+        'total_items': len(st.session_state.new_items_list),
+        'total_quantity': total_quantity,
+        'unique_products': unique_products,
+        'total_batches': total_batches
     }
 
-# ============== CALLBACKS FOR NO-RERUN OPERATIONS ==============
-
-def on_product_selected():
-    """Callback when product is selected"""
-    selected_key = st.session_state.get('product_selector_fast', '')
+def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
+    """Save all items to database"""
+    if not st.session_state.new_items_list:
+        return 0, ["No items to save"]
     
-    if selected_key and selected_key != "-- Select Product --":
-        # Parse product data from the key
-        product_data = st.session_state.get('product_lookup', {}).get(selected_key)
-        if product_data:
-            st.session_state.selected_product_data = product_data
-            
-            # Clear batch selection when product changes
-            st.session_state.selected_batch_data = None
-            
-            # Trigger batch loading
-            warehouse_id = st.session_state.get('current_warehouse_id')
-            if warehouse_id:
-                load_batches_for_product(product_data['product_id'], warehouse_id)
-    else:
-        st.session_state.selected_product_data = None
-        st.session_state.selected_batch_data = None
-
-def on_batch_selected():
-    """Callback when batch is selected"""
-    selected_batch = st.session_state.get('batch_selector_fast', '')
-    
-    if selected_batch and selected_batch != "-- Manual Entry --":
-        batch_no = selected_batch.split(" (")[0]
-        batches = st.session_state.cached_batches.get(st.session_state.selected_product_data['product_id'], [])
-        
-        for batch in batches:
-            if batch['batch_no'] == batch_no:
-                st.session_state.selected_batch_data = batch
-                # Auto-populate batch number
-                st.session_state.batch_no_input = batch['batch_no']
-                # Auto-populate location if available
-                if batch.get('location'):
-                    st.session_state.location_input = batch['location']
-                # Auto-populate expiry date if available
-                if batch.get('expired_date'):
-                    try:
-                        st.session_state.expiry_date_input = pd.to_datetime(batch['expired_date']).date()
-                    except:
-                        pass
-                break
-    else:
-        # Manual entry mode
-        st.session_state.selected_batch_data = None
-        # Clear auto-populated fields
-        if 'batch_no_input' in st.session_state:
-            st.session_state.batch_no_input = ""
-        if 'location_input' in st.session_state:
-            st.session_state.location_input = ""
-
-def load_batches_for_product(product_id: int, warehouse_id: int):
-    """Load batch details for selected product"""
-    cache_key = f"{product_id}_{warehouse_id}"
-    
-    # Check cache age
-    cache_time = st.session_state.cache_timestamp.get(f"batches_{cache_key}")
-    if cache_time and (datetime.now() - cache_time).seconds < 300:  # 5 min cache
-        return  # Use existing cache
-    
-    # Load fresh data
-    try:
-        batches = audit_service.get_product_batch_details(warehouse_id, product_id)
-        st.session_state.cached_batches[product_id] = batches
-        st.session_state.cache_timestamp[f"batches_{cache_key}"] = datetime.now()
-    except Exception as e:
-        logger.error(f"Error loading batches: {e}")
-        st.session_state.cached_batches[product_id] = []
-
-def add_count_callback():
-    """Callback for adding count without rerun"""
-    # Get form values
-    actual_qty = st.session_state.get('actual_qty_input', 0)
-    location = st.session_state.get('location_input', '')
-    notes = st.session_state.get('notes_input', '')
-    batch_no = st.session_state.get('batch_no_input', '')
-    expiry_date = st.session_state.get('expiry_date_input', None)
-    
-    if actual_qty > 0 and st.session_state.selected_product_data:
-        # Validate batch number
-        if not batch_no:
-            st.session_state.last_action = "⚠️ Please enter batch number"
-            st.session_state.last_action_time = datetime.now()
-            return
-        
-        # Parse location
-        zone, rack, bin_loc = parse_location(location)
-        
+    # Prepare data for database
+    count_list = []
+    for item in st.session_state.new_items_list:
         count_data = {
-            'transaction_id': st.session_state.selected_tx_id,
-            'product_id': st.session_state.selected_product_data['product_id'],
-            'product_name': st.session_state.selected_product_data['product_name'],
-            'pt_code': st.session_state.selected_product_data.get('pt_code', 'N/A'),
-            'batch_no': batch_no,
-            'expired_date': expiry_date,
-            'zone_name': zone,
-            'rack_name': rack,
-            'bin_name': bin_loc,
-            'location_notes': '',
-            'system_quantity': st.session_state.selected_batch_data['quantity'] if st.session_state.selected_batch_data else 0,
-            'system_value_usd': st.session_state.selected_batch_data.get('value_usd', 0) if st.session_state.selected_batch_data else 0,
-            'actual_quantity': actual_qty,
-            'actual_notes': notes,
+            'transaction_id': transaction_id,
+            'product_id': None,  # New item, no product_id
+            'batch_no': item.get('batch_no', ''),
+            'expired_date': item.get('expired_date'),
+            'zone_name': item.get('zone_name', ''),
+            'rack_name': item.get('rack_name', ''),
+            'bin_name': item.get('bin_name', ''),
+            'location_notes': item.get('location_notes', ''),
+            'system_quantity': 0,  # New item has no system quantity
+            'system_value_usd': 0,
+            'actual_quantity': item.get('actual_quantity', 0),
+            'actual_notes': f"NEW ITEM: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}",
+            'is_new_item': True,
             'created_by_user_id': st.session_state.user_id
         }
-        
-        should_save = add_temp_count_optimized(count_data)
-        
-        # Clear form inputs
-        st.session_state.actual_qty_input = 0.0
-        st.session_state.notes_input = ""
-        
-        # Clear batch selection if manual entry
-        if not st.session_state.selected_batch_data:
-            st.session_state.batch_no_input = ""
-        
-        # Auto-save if threshold reached
-        if should_save:
-            save_all_counts_callback()
-    else:
-        if actual_qty <= 0:
-            st.session_state.last_action = "⚠️ Please enter quantity > 0"
-        else:
-            st.session_state.last_action = "⚠️ Please select a product first"
-        st.session_state.last_action_time = datetime.now()
-
-def save_all_counts_callback():
-    """Save all temp counts without rerun"""
-    if not st.session_state.temp_counts:
-        st.session_state.last_action = "⚠️ No counts to save"
-        return
+        count_list.append(count_data)
     
-    try:
-        # Validate all counts have batch numbers
-        invalid_counts = [i for i, c in enumerate(st.session_state.temp_counts) if not c.get('batch_no')]
-        if invalid_counts:
-            st.session_state.last_action = f"⚠️ Missing batch numbers in {len(invalid_counts)} counts"
-            st.session_state.last_action_time = datetime.now()
-            return
-        
-        # Save batch
-        saved, errors = audit_service.save_batch_counts(st.session_state.temp_counts)
-        
-        if errors:
-            st.session_state.last_action = f"⚠️ Saved {saved} counts with {len(errors)} errors"
-            # Keep failed counts
-            st.session_state.temp_counts = [c for i, c in enumerate(st.session_state.temp_counts) if f"Row {i+1}" in str(errors)]
-        else:
-            st.session_state.last_action = f"✅ Successfully saved {saved} counts!"
-            clear_temp_counts()
-            
-            # Clear cache to refresh counts
-            cache_key = f"count_summary_{st.session_state.selected_tx_id}"
-            if cache_key in st.session_state.cached_count_summaries:
-                del st.session_state.cached_count_summaries[cache_key]
-        
-        st.session_state.last_action_time = datetime.now()
-        
-    except Exception as e:
-        st.session_state.last_action = f"❌ Error: {str(e)}"
-        st.session_state.last_action_time = datetime.now()
-
-def parse_location(location: str) -> Tuple[str, str, str]:
-    """Parse location string into zone, rack, bin"""
-    if not location:
-        return "", "", ""
+    # Save using batch save
+    saved, errors = audit_service.save_batch_counts(count_list)
     
-    if '-' in location:
-        parts = location.split('-')
-        zone = parts[0].strip() if len(parts) > 0 else ""
-        rack = parts[1].strip() if len(parts) > 1 else ""
-        bin_loc = parts[2].strip() if len(parts) > 2 else ""
-        return zone, rack, bin_loc
-    else:
-        return location.strip(), "", ""
-
-# ============== ROLE PERMISSIONS ==============
-
-AUDIT_ROLES = {
-    'admin': ['manage_sessions', 'view_all', 'create_transactions', 'export_data', 'user_management'],
-    'GM': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    'MD': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    'supply_chain': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    'sales_manager': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    'sales': ['create_transactions', 'view_own', 'view_assigned_sessions'],
-    'viewer': ['view_own', 'view_assigned_sessions'],
-    'customer': [],
-    'vendor': []
-}
-
-def check_permission(action: str) -> bool:
-    """Check if current user has permission for action"""
-    if 'user_role' not in st.session_state:
-        return False
+    if saved > 0:
+        st.session_state.last_save_time = datetime.now()
+        clear_all_items()
     
-    user_role = st.session_state.user_role
-    return action in AUDIT_ROLES.get(user_role, [])
+    return saved, errors
 
-# ============== MAIN APPLICATION ==============
+# ============== UI COMPONENTS ==============
 
-def main():
-    """Main application entry point"""
-    try:
-        # Check authentication
-        if not auth.check_session():
-            show_login_page()
-        else:
-            show_main_app()
-    except Exception as e:
-        st.error(f"Application error: {str(e)}")
-        logger.error(f"Main app error: {e}")
-
-def show_login_page():
-    """Display login page"""
-    st.title("🏭 Warehouse Audit System")
-    st.markdown("### Please login to access the system")
+def show_header():
+    """Display header with user info"""
+    col1, col2, col3 = st.columns([6, 2, 2])
     
-    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        st.title("📦 New Item Management")
+        st.caption("Add items found in warehouse but not in ERP system")
     
     with col2:
-        with st.form("login_form"):
-            username = st.text_input("Username", placeholder="Enter your username")
-            password = st.text_input("Password", type="password", placeholder="Enter your password")
-            submit = st.form_submit_button("🔐 Login", use_container_width=True)
-            
-            if submit:
-                if username and password:
-                    success, result = auth.authenticate(username, password)
-                    
-                    if success:
-                        auth.login(result)
-                        st.success("✅ Login successful!")
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {result.get('error', 'Login failed')}")
-                else:
-                    st.warning("⚠️ Please enter both username and password")
-
-def show_main_app():
-    """Display main application interface"""
-    # Sidebar with user info
-    with st.sidebar:
-        st.markdown("### 👤 User Info")
-        st.write(f"**Name:** {auth.get_user_display_name()}")
-        st.write(f"**Role:** {st.session_state.user_role}")
-        st.write(f"**Login:** {st.session_state.login_time.strftime('%H:%M')}")
-        
-        # Performance stats
-        if st.session_state.action_count > 0:
-            st.markdown("---")
-            st.markdown("**📊 Session Stats:**")
-            st.caption(f"Actions: {st.session_state.action_count}")
-            uptime = datetime.now() - st.session_state.last_refresh_time
-            st.caption(f"Uptime: {str(uptime).split('.')[0]}")
-        
-        st.markdown("---")
-        
+        st.metric("User", auth.get_user_display_name())
+    
+    with col3:
         if st.button("🚪 Logout", use_container_width=True):
             auth.logout()
             st.rerun()
-    
-    # Main content based on role
-    user_role = st.session_state.user_role
-    
-    if not AUDIT_ROLES.get(user_role, []):
-        show_no_access_interface()
-    elif check_permission('manage_sessions'):
-        show_admin_interface()
-    elif check_permission('create_transactions'):
-        show_user_interface()
-    else:
-        show_viewer_interface()
 
-def show_no_access_interface():
-    """Interface for users without audit permissions"""
-    st.title("🚫 Access Restricted")
-    st.warning("⚠️ You don't have permission to access the Audit System")
-
-def show_admin_interface():
-    """Admin interface for session management"""
-    st.title("🔧 Admin Dashboard")
+def show_summary_bar():
+    """Display summary statistics bar"""
+    summary = get_items_summary()
     
-    user_role = st.session_state.user_role
-    is_super_admin = user_role in ['admin']
-    
-    if is_super_admin:
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Session Management", "📊 Dashboard", "📈 Reports", "📦 Warehouse Audit", "👥 User Management"])
-        
-        with tab5:
-            st.info("🚧 User management features coming soon...")
-    else:
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 Session Management", "📊 Dashboard", "📈 Reports", "📦 Warehouse Audit"])
-    
-    with tab1:
-        st.info("Session management page - implementation continues...")
-    
-    with tab2:
-        st.info("Dashboard page - implementation continues...")
-    
-    with tab3:
-        st.info("Reports page - implementation continues...")
-    
-    with tab4:
-        show_warehouse_audit_content_optimized()
-
-def show_user_interface():
-    """User interface for transactions and counting"""
-    st.title("📦 Warehouse Audit")
-    show_warehouse_audit_content_optimized()
-
-def show_viewer_interface():
-    """Viewer interface - read only"""
-    st.title("👀 Audit Viewer")
-    st.info("Viewer interface - implementation continues...")
-
-# ============== OPTIMIZED WAREHOUSE AUDIT CONTENT ==============
-
-def show_warehouse_audit_content_optimized():
-    """Optimized warehouse audit content with minimal reruns"""
-    subtab1, subtab2 = st.tabs(["📝 My Transactions", "🔢 Counting"])
-    
-    with subtab1:
-        my_transactions_page_optimized()
-    
-    with subtab2:
-        counting_page_optimized()
-
-def my_transactions_page_optimized():
-    """Optimized transactions management page"""
-    st.subheader("📝 My Audit Transactions")
-    
-    # Get active sessions
-    try:
-        active_sessions = audit_service.get_sessions_by_status('in_progress')
-        
-        if not active_sessions:
-            st.warning("⚠️ No active audit sessions available")
-            return
-        
-        session_options = {
-            f"{s['session_name']} ({s['session_code']})": s['id'] 
-            for s in active_sessions
-        }
-        
-        selected_session_key = st.selectbox("Select Active Session", session_options.keys())
-        selected_session_id = session_options[selected_session_key]
-        
-        if selected_session_id:
-            st.session_state.selected_session_id = selected_session_id
-            
-            # Create new transaction
-            with st.expander("➕ Create New Transaction"):
-                create_transaction_form_optimized(selected_session_id)
-            
-            # My transactions
-            st.subheader("📦 My Transactions")
-            show_my_transactions_optimized(selected_session_id)
-            
-    except Exception as e:
-        st.error(f"Error loading transactions: {str(e)}")
-
-def create_transaction_form_optimized(session_id: int):
-    """Optimized transaction creation form"""
-    with st.form("create_transaction", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+    if summary['total_items'] > 0:
+        col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.5, 1.5, 2.5])
         
         with col1:
-            transaction_name = st.text_input("Transaction Name*", 
-                placeholder="e.g., Zone A1-A3 counting")
-            assigned_zones = st.text_input("Assigned Zones", 
-                placeholder="e.g., A1,A2,A3")
+            status_color = "🟡" if summary['total_items'] < 10 else "🔴"
+            st.markdown(f"### {status_color} Pending Items")
         
         with col2:
-            assigned_categories = st.text_input("Assigned Categories", 
-                placeholder="e.g., Cold items")
-            notes = st.text_area("Notes", placeholder="Additional notes")
+            st.metric("Items", summary['total_items'], 
+                     delta=f"/{20} max" if summary['total_items'] < 20 else "MAX")
         
-        submit = st.form_submit_button("📝 Create Transaction", use_container_width=True)
+        with col3:
+            st.metric("Quantity", f"{summary['total_quantity']:.0f}")
         
-        if submit and transaction_name:
+        with col4:
+            st.metric("Products", summary['unique_products'])
+        
+        with col5:
+            col_save, col_clear, col_export = st.columns(3)
+            
+            with col_save:
+                save_disabled = summary['total_items'] == 0
+                if st.button("💾 Save All", use_container_width=True, 
+                           type="primary", disabled=save_disabled):
+                    st.session_state.trigger_save = True
+            
+            with col_clear:
+                if st.button("🗑️ Clear", use_container_width=True):
+                    st.session_state.show_clear_confirm = True
+            
+            with col_export:
+                if st.button("📥 Export", use_container_width=True):
+                    export_items_to_csv()
+        
+        st.markdown("---")
+
+def show_transaction_selector():
+    """Show transaction selector"""
+    st.markdown("### 📋 Select Transaction")
+    
+    # Get user's draft transactions
+    if 'selected_session_id' not in st.session_state:
+        sessions = audit_service.get_sessions_by_status('in_progress')
+        if sessions:
+            st.session_state.selected_session_id = sessions[0]['id']
+    
+    if 'selected_session_id' in st.session_state:
+        transactions = audit_service.get_user_transactions(
+            st.session_state.selected_session_id,
+            st.session_state.user_id,
+            status='draft'
+        )
+        
+        if transactions:
+            tx_options = {
+                f"{tx['transaction_name']} ({tx['transaction_code']})": tx
+                for tx in transactions
+            }
+            
+            selected_key = st.selectbox(
+                "Select your draft transaction:",
+                options=list(tx_options.keys()),
+                help="Select the transaction to add new items to"
+            )
+            
+            selected_tx = tx_options[selected_key]
+            st.session_state.selected_tx_id = selected_tx['id']
+            
+            # Show transaction info
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.info(f"📍 Warehouse: {selected_tx.get('warehouse_name', 'N/A')}")
+            with col2:
+                st.info(f"🏷️ Zones: {selected_tx.get('assigned_zones', 'All')}")
+            with col3:
+                st.info(f"📦 Items Counted: {selected_tx.get('total_items_counted', 0)}")
+            
+            return selected_tx['id']
+        else:
+            st.warning("⚠️ No draft transactions available. Please create one first.")
+            return None
+    else:
+        st.warning("⚠️ No active session found. Please select a session.")
+        return None
+
+def show_entry_form():
+    """Show optimized entry form"""
+    st.markdown("### ✏️ Add New Item")
+    
+    # Entry mode selector
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        entry_mode = st.radio(
+            "Entry Mode:",
+            ["Quick", "Detailed"],
+            index=0 if st.session_state.quick_entry_mode else 1,
+            horizontal=True
+        )
+        st.session_state.quick_entry_mode = (entry_mode == "Quick")
+    
+    # Form container
+    with st.container():
+        if st.session_state.quick_entry_mode:
+            show_quick_entry_form()
+        else:
+            show_detailed_entry_form()
+
+def show_quick_entry_form():
+    """Quick entry form for fast input"""
+    col1, col2, col3 = st.columns([3, 2, 1])
+    
+    with col1:
+        # Combined product input
+        product_input = st.text_input(
+            "Product Name | Brand | Notes",
+            key="quick_product",
+            placeholder="e.g., Paracetamol 500mg | GSK | Box damaged",
+            help="Use | to separate: Name | Brand | Notes"
+        )
+    
+    with col2:
+        col_qty, col_batch = st.columns(2)
+        
+        with col_qty:
+            quantity = st.number_input(
+                "Quantity",
+                min_value=0.0,
+                step=1.0,
+                key="quick_qty",
+                format="%.0f"
+            )
+        
+        with col_batch:
+            batch_no = st.text_input(
+                "Batch",
+                key="quick_batch",
+                placeholder="Optional"
+            )
+    
+    with col3:
+        location = st.text_input(
+            "Location",
+            key="quick_location",
+            value=f"{st.session_state.default_location['zone']}-{st.session_state.default_location['rack']}-{st.session_state.default_location['bin']}".strip('-'),
+            placeholder="A1-R1-B1"
+        )
+        
+        # Add button
+        add_enabled = product_input and quantity > 0
+        if st.button("➕ Add", use_container_width=True, 
+                    disabled=not add_enabled or len(st.session_state.new_items_list) >= 20,
+                    type="primary"):
             try:
-                transaction_code = audit_service.create_transaction({
-                    'session_id': session_id,
-                    'transaction_name': transaction_name,
-                    'assigned_zones': assigned_zones,
-                    'assigned_categories': assigned_categories,
+                # Parse product input
+                parts = product_input.split('|')
+                product_name = parts[0].strip() if len(parts) > 0 else ""
+                brand = parts[1].strip() if len(parts) > 1 else ""
+                notes = parts[2].strip() if len(parts) > 2 else ""
+                
+                # Parse location
+                loc_parts = location.split('-') if location else []
+                zone = loc_parts[0].strip() if len(loc_parts) > 0 else ""
+                rack = loc_parts[1].strip() if len(loc_parts) > 1 else ""
+                bin_name = loc_parts[2].strip() if len(loc_parts) > 2 else ""
+                
+                # Update default location
+                if zone:
+                    st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
+                
+                # Add item
+                item_data = {
+                    'product_name': product_name,
+                    'brand': brand,
+                    'batch_no': batch_no,
+                    'actual_quantity': quantity,
+                    'zone_name': zone,
+                    'rack_name': rack,
+                    'bin_name': bin_name,
                     'notes': notes,
+                    'expired_date': None,
                     'created_by_user_id': st.session_state.user_id
-                })
+                }
                 
-                st.success(f"✅ Transaction created! Code: {transaction_code}")
+                add_new_item(item_data)
+                st.success(f"✅ Added: {product_name}")
                 
-                # Clear transaction cache
-                st.session_state.cached_transactions = None
-                time.sleep(1)
+                # Clear inputs
+                for key in ['quick_product', 'quick_qty', 'quick_batch']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                
+                time.sleep(0.5)
                 st.rerun()
                 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
 
-def show_my_transactions_optimized(session_id: int):
-    """Display transactions with minimal reruns"""
-    try:
-        # Use cached transactions if available
-        cache_key = f"transactions_{session_id}_{st.session_state.user_id}"
+def show_detailed_entry_form():
+    """Detailed entry form with all fields"""
+    with st.form("detailed_entry_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
         
-        if st.session_state.cached_transactions is None:
-            transactions = audit_service.get_user_transactions(
-                session_id, st.session_state.user_id
-            )
-            st.session_state.cached_transactions = transactions
-        else:
-            transactions = st.session_state.cached_transactions
+        with col1:
+            product_name = st.text_input("Product Name*", placeholder="Enter product name")
+            brand = st.text_input("Brand", placeholder="Enter brand name")
+            batch_no = st.text_input("Batch Number", placeholder="Enter batch number")
+            package_size = st.text_input("Package Size", placeholder="e.g., 100 tablets")
         
-        if transactions:
-            for tx in transactions:
-                with st.container():
-                    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-                    
-                    with col1:
-                        st.write(f"**{tx['transaction_name']}**")
-                        st.caption(f"Code: {tx['transaction_code']}")
-                    
-                    with col2:
-                        st.write(f"Status: {tx['status'].title()}")
-                        if tx['assigned_zones']:
-                            st.caption(f"Zones: {tx['assigned_zones']}")
-                    
-                    with col3:
-                        st.write(f"Items: {tx['total_items_counted']}")
-                    
-                    with col4:
-                        if tx['status'] == 'draft':
-                            if st.button("✅ Submit", key=f"submit_{tx['id']}"):
-                                try:
-                                    if tx.get('total_items_counted', 0) > 0:
-                                        audit_service.submit_transaction(tx['id'], st.session_state.user_id)
-                                        st.success("✅ Transaction submitted!")
-                                        st.session_state.cached_transactions = None
-                                        time.sleep(1)
-                                        st.rerun()
-                                    else:
-                                        st.warning("⚠️ Count items first")
-                                except Exception as e:
-                                    st.error(f"❌ Error: {str(e)}")
-                    
-                    st.markdown("---")
-        else:
-            st.info("No transactions created yet")
+        with col2:
+            quantity = st.number_input("Quantity*", min_value=0.0, step=1.0, format="%.2f")
+            expired_date = st.date_input("Expiry Date", value=None)
             
-    except Exception as e:
-        st.error(f"Error loading transactions: {str(e)}")
+            # Location inputs
+            st.markdown("**Location**")
+            col_z, col_r, col_b = st.columns(3)
+            with col_z:
+                zone = st.text_input("Zone", value=st.session_state.default_location['zone'])
+            with col_r:
+                rack = st.text_input("Rack", value=st.session_state.default_location['rack'])
+            with col_b:
+                bin_name = st.text_input("Bin", value=st.session_state.default_location['bin'])
+        
+        notes = st.text_area("Additional Notes", placeholder="Any observations or special conditions")
+        
+        # Submit button
+        col_submit, col_reset = st.columns([3, 1])
+        
+        with col_submit:
+            submitted = st.form_submit_button(
+                "➕ Add to List",
+                use_container_width=True,
+                type="primary",
+                disabled=len(st.session_state.new_items_list) >= 20
+            )
+        
+        with col_reset:
+            reset = st.form_submit_button("🔄 Reset", use_container_width=True)
+        
+        if submitted and product_name and quantity > 0:
+            try:
+                item_data = {
+                    'product_name': product_name,
+                    'brand': brand,
+                    'batch_no': batch_no,
+                    'package_size': package_size,
+                    'actual_quantity': quantity,
+                    'expired_date': expired_date,
+                    'zone_name': zone,
+                    'rack_name': rack,
+                    'bin_name': bin_name,
+                    'notes': notes,
+                    'created_by_user_id': st.session_state.user_id
+                }
+                
+                add_new_item(item_data)
+                st.success(f"✅ Added: {product_name}")
+                
+                # Update default location
+                if zone:
+                    st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
+                
+                time.sleep(0.5)
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
 
-# ============== OPTIMIZED COUNTING PAGE ==============
-
-def counting_page_optimized():
-    """Highly optimized counting page with minimal reruns"""
-    st.subheader("🔢 Fast Inventory Counting")
-    
-    # Initialize session state
-    init_session_state()
-    
-    # Transaction selection
-    if 'selected_session_id' not in st.session_state:
-        st.warning("⚠️ Please select a session in My Transactions first")
+def show_items_preview():
+    """Display preview of pending items"""
+    if not st.session_state.new_items_list:
         return
     
-    # Get draft transactions
-    try:
-        if st.session_state.cached_transactions is None:
-            transactions = audit_service.get_user_transactions(
-                st.session_state.selected_session_id,
-                st.session_state.user_id,
-                status='draft'
-            )
-            st.session_state.cached_transactions = [t for t in transactions if t['status'] == 'draft']
-        
-        draft_transactions = [t for t in st.session_state.cached_transactions if t['status'] == 'draft']
-        
-        if not draft_transactions:
-            st.warning("⚠️ No draft transactions available for counting")
-            # Refresh transactions
-            if st.button("🔄 Refresh Transactions"):
-                st.session_state.cached_transactions = None
-                st.rerun()
-            return
-        
-        # Transaction selector
-        tx_options = {
-            f"{tx['transaction_name']} ({tx['transaction_code']})": tx
-            for tx in draft_transactions
-        }
-        
-        selected_tx_key = st.selectbox(
-            "Select Transaction",
-            options=list(tx_options.keys()),
-            key="tx_selector_counting"
-        )
-        
-        selected_tx = tx_options[selected_tx_key]
-        st.session_state.selected_tx_id = selected_tx['id']
-        st.session_state.current_warehouse_id = selected_tx['warehouse_id']
-        
-        # Settings row
-        col_settings = st.columns([1, 1, 1, 3])
-        
-        with col_settings[0]:
-            st.session_state.counting_mode = st.radio(
-                "Mode",
-                ["fast", "detailed"],
-                format_func=lambda x: "⚡ Fast" if x == "fast" else "📋 Detailed",
-                horizontal=True,
-                key="counting_mode_selector"
-            )
-        
-        with col_settings[1]:
-            st.session_state.auto_save_enabled = st.checkbox(
-                "Auto-save",
-                value=st.session_state.auto_save_enabled,
-                help="Auto-save when reaching threshold"
-            )
-        
-        with col_settings[2]:
-            if st.session_state.auto_save_enabled:
-                st.session_state.auto_save_threshold = st.number_input(
-                    "Threshold",
-                    min_value=5,
-                    max_value=20,
-                    value=10,
-                    step=5,
-                    key="auto_save_threshold_input"
-                )
-        
-        # Status display
-        show_status_bar()
-        
-        # Main counting interface
-        if st.session_state.counting_mode == "fast":
-            fast_counting_interface(selected_tx['id'], selected_tx['warehouse_id'])
-        else:
-            detailed_counting_interface(selected_tx['id'], selected_tx['warehouse_id'])
-            
-    except Exception as e:
-        st.error(f"Error in counting page: {str(e)}")
-        logger.error(f"Counting page error: {e}")
-
-def show_status_bar():
-    """Show status bar with last action and temp counts"""
-    col1, col2, col3 = st.columns([3, 1, 1])
+    st.markdown("### 📋 Pending Items")
     
+    # Display options
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        # Last action message
-        if st.session_state.last_action:
-            # Calculate age of last action
-            if st.session_state.last_action_time:
-                age = (datetime.now() - st.session_state.last_action_time).seconds
-                if age < 5:  # Show for 5 seconds
-                    if "✅" in st.session_state.last_action:
-                        st.success(st.session_state.last_action)
-                    elif "⚠️" in st.session_state.last_action:
-                        st.warning(st.session_state.last_action)
-                    elif "❌" in st.session_state.last_action:
-                        st.error(st.session_state.last_action)
-                    else:
-                        st.info(st.session_state.last_action)
-    
+        view_mode = st.radio("View", ["Compact", "Detailed"], horizontal=True)
     with col2:
-        # Temp counts summary
-        summary = get_temp_counts_summary()
-        if summary['total'] > 0:
-            st.metric("Pending", f"{summary['total']}/20")
-    
+        sort_by = st.selectbox("Sort by", ["Added Time", "Product Name", "Quantity"])
     with col3:
-        # Quick actions
-        if st.session_state.temp_counts:
-            if st.button("💾 Save All", use_container_width=True, key="quick_save_btn"):
-                save_all_counts_callback()
+        st.write("")  # Spacer
+    
+    # Sort items
+    items = st.session_state.new_items_list.copy()
+    if sort_by == "Product Name":
+        items.sort(key=lambda x: x.get('product_name', ''))
+    elif sort_by == "Quantity":
+        items.sort(key=lambda x: x.get('actual_quantity', 0), reverse=True)
+    else:  # Added Time
+        items.reverse()  # Most recent first
+    
+    # Display items
+    if view_mode == "Compact":
+        show_compact_preview(items)
+    else:
+        show_detailed_preview(items)
+
+def show_compact_preview(items: List[Dict]):
+    """Compact view of items"""
+    for idx, item in enumerate(items):
+        col1, col2, col3, col4, col5 = st.columns([3, 1.5, 1.5, 1.5, 1])
+        
+        with col1:
+            product_display = f"**{item['product_name']}**"
+            if item.get('brand'):
+                product_display += f" - {item['brand']}"
+            st.write(product_display)
+            
+            # Location info
+            location = f"{item.get('zone_name', '')}-{item.get('rack_name', '')}-{item.get('bin_name', '')}".strip('-')
+            if location and location != '--':
+                st.caption(f"📍 {location}")
+        
+        with col2:
+            st.write(f"Qty: **{item['actual_quantity']:.0f}**")
+        
+        with col3:
+            if item.get('batch_no'):
+                st.caption(f"Batch: {item['batch_no']}")
+        
+        with col4:
+            added_time = item.get('added_time', datetime.now())
+            time_diff = datetime.now() - added_time
+            if time_diff.seconds < 60:
+                st.caption("Just now")
+            elif time_diff.seconds < 3600:
+                st.caption(f"{time_diff.seconds // 60}m ago")
+            else:
+                st.caption(f"{time_diff.seconds // 3600}h ago")
+        
+        with col5:
+            if st.button("🗑️", key=f"del_{item['temp_id']}", help="Remove this item"):
+                remove_item(item['temp_id'])
+                st.rerun()
+        
+        if idx < len(items) - 1:
+            st.markdown("---")
+
+def show_detailed_preview(items: List[Dict]):
+    """Detailed view of items"""
+    for idx, item in enumerate(items):
+        with st.expander(f"{item['product_name']} - Qty: {item['actual_quantity']:.0f}", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**Product:** {item['product_name']}")
+                st.write(f"**Brand:** {item.get('brand', 'N/A')}")
+                st.write(f"**Batch:** {item.get('batch_no', 'N/A')}")
+                st.write(f"**Package Size:** {item.get('package_size', 'N/A')}")
+            
+            with col2:
+                st.write(f"**Quantity:** {item['actual_quantity']:.2f}")
+                st.write(f"**Expiry:** {item.get('expired_date', 'N/A')}")
+                location = f"{item.get('zone_name', '')}-{item.get('rack_name', '')}-{item.get('bin_name', '')}".strip('-')
+                st.write(f"**Location:** {location if location else 'N/A'}")
+                st.write(f"**Notes:** {item.get('notes', 'N/A')}")
+            
+            if st.button(f"Remove", key=f"del_detail_{item['temp_id']}", type="secondary"):
+                remove_item(item['temp_id'])
                 st.rerun()
 
-def fast_counting_interface(transaction_id: int, warehouse_id: int):
-    """Fast counting interface with minimal UI elements"""
-    
-    # Create layout
-    col_left, col_right = st.columns([2, 1])
-    
-    with col_left:
-        # Product search and selection
-        render_product_selector(warehouse_id)
-        
-        # Counting form
-        if st.session_state.selected_product_data:
-            render_fast_count_form(transaction_id)
-    
-    with col_right:
-        # Temp counts display
-        render_temp_counts_sidebar()
-        
-        # Progress summary
-        render_progress_summary(transaction_id)
-
-def render_product_selector(warehouse_id: int):
-    """Render optimized product selector"""
-    st.markdown("#### 📦 Product Selection")
-    
-    # Load products if not cached
-    if st.session_state.cached_products is None:
-        with st.spinner("Loading products..."):
-            products = cached_get_warehouse_products(warehouse_id)
-            st.session_state.cached_products = products
-    else:
-        products = st.session_state.cached_products
-    
-    if not products:
-        st.warning("⚠️ No products available")
+def export_items_to_csv():
+    """Export items to CSV"""
+    if not st.session_state.new_items_list:
         return
     
-    # Get count summaries
-    if st.session_state.selected_tx_id:
-        cache_key = f"count_summary_{st.session_state.selected_tx_id}"
-        
-        if cache_key not in st.session_state.cached_count_summaries:
-            summaries = audit_service.get_transaction_count_summary(st.session_state.selected_tx_id)
-            st.session_state.cached_count_summaries[cache_key] = {s['product_id']: s for s in summaries}
-        
-        count_summaries = st.session_state.cached_count_summaries[cache_key]
-    else:
-        count_summaries = {}
+    # Create DataFrame
+    df_data = []
+    for item in st.session_state.new_items_list:
+        df_data.append({
+            'Product Name': item.get('product_name', ''),
+            'Brand': item.get('brand', ''),
+            'Batch Number': item.get('batch_no', ''),
+            'Quantity': item.get('actual_quantity', 0),
+            'Expiry Date': item.get('expired_date', ''),
+            'Zone': item.get('zone_name', ''),
+            'Rack': item.get('rack_name', ''),
+            'Bin': item.get('bin_name', ''),
+            'Notes': item.get('notes', ''),
+            'Added Time': item.get('added_time', '')
+        })
     
-    # Create product options with status
-    product_options = ["-- Select Product --"]
-    product_lookup = {}
+    df = pd.DataFrame(df_data)
+    csv = df.to_csv(index=False)
     
-    for p in products:
-        # Get count status
-        count_info = count_summaries.get(p['product_id'], {})
-        counted_qty = count_info.get('total_counted', 0)
-        system_qty = p.get('total_quantity', 0)
-        
-        # Check temp counts
-        temp_qty = sum(tc['actual_quantity'] for tc in st.session_state.temp_counts 
-                      if tc.get('product_id') == p['product_id'])
-        
-        # Status indicator
-        if temp_qty > 0:
-            status = "📝"  # Has pending
-        elif counted_qty >= system_qty * 0.95:
-            status = "✅"  # Fully counted
-        elif counted_qty > 0:
-            status = "🟡"  # Partially counted
-        else:
-            status = "⭕"  # Not counted
-        
-        # Format option
-        display = f"{status} {p.get('pt_code', 'N/A')} - {p.get('product_name', 'Unknown')[:50]}"
-        if counted_qty > 0 or temp_qty > 0:
-            display += f" (Counted: {counted_qty:.0f}"
-            if temp_qty > 0:
-                display += f", Pending: {temp_qty:.0f}"
-            display += ")"
-        
-        product_options.append(display)
-        product_lookup[display] = p
-    
-    st.session_state.product_lookup = product_lookup
-    
-    # Product selector with callback
-    st.selectbox(
-        "Choose Product",
-        options=product_options,
-        key="product_selector_fast",
-        on_change=on_product_selected,
-        help="⭕ Not counted | 🟡 Partial | ✅ Complete | 📝 Has pending"
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    st.download_button(
+        label="📥 Download CSV",
+        data=csv,
+        file_name=f"new_items_{timestamp}.csv",
+        mime="text/csv"
     )
 
-def render_fast_count_form(transaction_id: int):
-    """Render fast counting form"""
-    st.markdown("#### ✏️ Quick Count")
-    
-    product = st.session_state.selected_product_data
-    
-    # Product info
-    col1, col2 = st.columns(2)
-    with col1:
-        st.info(f"**{product['product_name']}**\nPT: {product.get('pt_code', 'N/A')}")
-    with col2:
-        st.info(f"**System Total:** {product.get('total_quantity', 0):.0f}")
-    
-    # Batch selector if batches loaded
-    if product['product_id'] in st.session_state.cached_batches:
-        batches = st.session_state.cached_batches[product['product_id']]
+def handle_save_action(transaction_id: int):
+    """Handle save action with progress"""
+    if 'trigger_save' in st.session_state and st.session_state.trigger_save:
+        st.session_state.trigger_save = False
         
-        if batches:
-            batch_options = ["-- Manual Entry --"] + [
-                f"{b['batch_no']} (Qty: {b['quantity']:.0f}, Exp: {b.get('expired_date', 'N/A') if b.get('expired_date') else 'N/A'})"
-                for b in batches
-            ]
+        with st.spinner(f"Saving {len(st.session_state.new_items_list)} items..."):
+            progress_bar = st.progress(0)
             
-            st.selectbox(
-                "Quick Select Batch",
-                options=batch_options,
-                key="batch_selector_fast",
-                on_change=on_batch_selected
-            )
+            # Simulate progress
+            for i in range(50):
+                progress_bar.progress(i / 100)
+                time.sleep(0.01)
+            
+            # Save to database
+            saved, errors = save_items_to_db(transaction_id)
+            
+            progress_bar.progress(100)
+            time.sleep(0.5)
+            
+            if errors and saved == 0:
+                st.error(f"❌ Failed to save items")
+                for error in errors[:3]:
+                    st.caption(f"• {error}")
+            elif errors and saved > 0:
+                st.warning(f"⚠️ Saved {saved} items with {len(errors)} errors")
+            else:
+                st.success(f"✅ Successfully saved {saved} items!")
+                st.balloons()
+                time.sleep(1)
+                st.rerun()
+
+def handle_clear_confirmation():
+    """Handle clear all confirmation"""
+    if 'show_clear_confirm' in st.session_state and st.session_state.show_clear_confirm:
+        st.session_state.show_clear_confirm = False
+        
+        with st.container():
+            st.warning("⚠️ Are you sure you want to clear all pending items?")
+            col1, col2, col3 = st.columns([1, 1, 3])
+            
+            with col1:
+                if st.button("✅ Yes, Clear All", type="primary"):
+                    clear_all_items()
+                    st.success("✅ All items cleared!")
+                    time.sleep(0.5)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancel"):
+                    st.rerun()
+
+# ============== MAIN APPLICATION ==============
+
+def main():
+    """Main application entry"""
+    init_session_state()
     
-    # Show selected batch info
-    if st.session_state.selected_batch_data:
-        batch_info = st.session_state.selected_batch_data
-        st.success(f"📦 Selected Batch: {batch_info['batch_no']} | System Qty: {batch_info['quantity']:.0f} | Location: {batch_info.get('location', 'N/A')}")
+    # Check authentication
+    if not auth.check_session():
+        show_login_page()
+    else:
+        show_main_app()
+
+def show_login_page():
+    """Display login page"""
+    st.title("🔐 Login - New Item Management")
     
-    # Count inputs
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        # Batch number field - auto-populated or manual entry
-        default_batch_no = ""
-        batch_disabled = False
-        
-        if st.session_state.selected_batch_data:
-            default_batch_no = st.session_state.selected_batch_data['batch_no']
-            batch_disabled = True  # Disable when auto-selected
-        
-        st.text_input(
-            "Batch Number*",
-            value=default_batch_no,
-            placeholder="Enter batch number",
-            key="batch_no_input",
-            disabled=batch_disabled,
-            help="Auto-filled when batch selected above"
-        )
-        
-        # Actual quantity
-        st.number_input(
-            "Actual Quantity*",
-            min_value=0.0,
-            step=1.0,
-            format="%.0f",
-            key="actual_qty_input"
-        )
-        
-        # Location
-        default_location = ""
-        if st.session_state.selected_batch_data:
-            default_location = st.session_state.selected_batch_data.get('location', '')
-        
-        st.text_input(
-            "Location",
-            value=default_location,
-            placeholder="A1-R01-B01",
-            key="location_input"
-        )
+    col1, col2, col3 = st.columns([1, 2, 1])
     
     with col2:
-        # Expiry date - auto-populated if available
-        if st.session_state.selected_batch_data and st.session_state.selected_batch_data.get('expired_date'):
-            try:
-                exp_date = pd.to_datetime(st.session_state.selected_batch_data['expired_date']).date()
-                st.date_input(
-                    "Expiry Date",
-                    value=exp_date,
-                    key="expiry_date_input",
-                    disabled=True
-                )
-            except:
-                st.date_input("Expiry Date", key="expiry_date_input")
-        else:
-            st.date_input("Expiry Date", key="expiry_date_input")
-        
-        # Notes
-        st.text_area(
-            "Notes",
-            placeholder="Optional notes",
-            height=100,
-            key="notes_input"
-        )
+        with st.form("login_form"):
+            username = st.text_input("Username", placeholder="Enter username")
+            password = st.text_input("Password", type="password", placeholder="Enter password")
+            submit = st.form_submit_button("Login", use_container_width=True)
+            
+            if submit and username and password:
+                success, result = auth.authenticate(username, password)
+                if success:
+                    auth.login(result)
+                    st.success("✅ Login successful!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result.get('error', 'Login failed')}")
+
+def show_main_app():
+    """Main application interface"""
+    # Header
+    show_header()
     
-    # Action buttons
-    col1, col2, col3 = st.columns(3)
+    # Summary bar
+    show_summary_bar()
+    
+    # Transaction selector
+    transaction_id = show_transaction_selector()
+    
+    if transaction_id:
+        # Main content in tabs
+        tab1, tab2, tab3 = st.tabs(["📝 Add Items", "📋 Review & Save", "📊 Statistics"])
+        
+        with tab1:
+            # Entry form
+            show_entry_form()
+            
+            # Show compact preview in sidebar
+            with st.sidebar:
+                st.markdown("### 📦 Quick Preview")
+                summary = get_items_summary()
+                st.metric("Pending Items", summary['total_items'])
+                
+                if st.session_state.new_items_list:
+                    for item in st.session_state.new_items_list[-5:]:  # Show last 5
+                        st.caption(f"• {item['product_name'][:20]}... - Qty: {item['actual_quantity']:.0f}")
+        
+        with tab2:
+            # Items preview
+            show_items_preview()
+            
+            # Save section
+            if st.session_state.new_items_list:
+                st.markdown("---")
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.info(f"💡 Ready to save {len(st.session_state.new_items_list)} items to transaction")
+                
+                with col2:
+                    if st.button("💾 Save to Database", use_container_width=True, type="primary"):
+                        st.session_state.trigger_save = True
+        
+        with tab3:
+            show_statistics()
+        
+        # Handle save action
+        handle_save_action(transaction_id)
+        
+        # Handle clear confirmation
+        handle_clear_confirmation()
+    
+    # Footer
+    st.markdown("---")
+    if st.session_state.last_save_time:
+        st.caption(f"Last save: {st.session_state.last_save_time.strftime('%H:%M:%S')}")
+
+def show_statistics():
+    """Show statistics and analytics"""
+    st.markdown("### 📊 Session Statistics")
+    
+    summary = get_items_summary()
+    
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.button(
-            f"➕ Add ({len(st.session_state.temp_counts)}/20)",
-            on_click=add_count_callback,
-            disabled=len(st.session_state.temp_counts) >= 20,
-            use_container_width=True,
-            type="primary"
-        )
+        st.metric("Total Items", summary['total_items'])
     
     with col2:
-        st.button(
-            "💾 Save All",
-            on_click=save_all_counts_callback,
-            disabled=len(st.session_state.temp_counts) == 0,
-            use_container_width=True
-        )
+        st.metric("Total Quantity", f"{summary['total_quantity']:.0f}")
     
     with col3:
-        if st.button("🔄 Clear", use_container_width=True):
-            # Clear all form fields
-            st.session_state.actual_qty_input = 0.0
-            st.session_state.location_input = ""
-            st.session_state.notes_input = ""
-            st.session_state.batch_no_input = ""
-            st.session_state.expiry_date_input = None
-            st.session_state.selected_batch_data = None
-            st.session_state.batch_selector_fast = "-- Manual Entry --"
-
-def render_temp_counts_sidebar():
-    """Render temp counts in sidebar format"""
-    if st.session_state.temp_counts:
-        st.markdown(f"#### 📋 Pending ({len(st.session_state.temp_counts)})")
-        
-        # Create scrollable container
-        with st.container():
-            for i, count in enumerate(st.session_state.temp_counts):
-                # Create expandable header with key info
-                header = f"{count['pt_code']} | Batch: {count.get('batch_no', 'N/A')} | Qty: {count['actual_quantity']:.0f}"
-                
-                with st.expander(header, expanded=False):
-                    st.caption(f"Product: {count['product_name']}")
-                    st.caption(f"Batch: {count.get('batch_no', 'N/A')}")
-                    if count.get('expired_date'):
-                        st.caption(f"Expiry: {count['expired_date']}")
-                    
-                    location = f"{count.get('zone_name', '')}"
-                    if count.get('rack_name'):
-                        location += f"-{count['rack_name']}"
-                    if count.get('bin_name'):
-                        location += f"-{count['bin_name']}"
-                    if location.strip():
-                        st.caption(f"Location: {location}")
-                    
-                    # Show variance if available
-                    if count.get('system_quantity', 0) > 0:
-                        variance = count['actual_quantity'] - count['system_quantity']
-                        variance_pct = (variance / count['system_quantity']) * 100
-                        if variance != 0:
-                            if variance > 0:
-                                st.caption(f"📈 Variance: +{variance:.0f} ({variance_pct:+.1f}%)")
-                            else:
-                                st.caption(f"📉 Variance: {variance:.0f} ({variance_pct:+.1f}%)")
-                    
-                    if count.get('actual_notes'):
-                        st.caption(f"Notes: {count['actual_notes']}")
-                    
-                    if st.button(f"🗑️ Remove", key=f"remove_{i}"):
-                        remove_temp_count(i)
-                        st.rerun()
-    else:
-        st.info("No pending counts")
-
-def render_progress_summary(transaction_id: int):
-    """Render progress summary"""
-    st.markdown("#### 📊 Progress")
+        st.metric("Unique Products", summary['unique_products'])
     
-    try:
-        # Get progress from service
-        progress = audit_service.get_transaction_progress(transaction_id)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Saved Items", progress.get('items_counted', 0))
-        
-        with col2:
-            st.metric("Total Value", f"${progress.get('total_value', 0):,.0f}")
-        
-        # Include pending counts
-        if st.session_state.temp_counts:
-            st.caption(f"➕ {len(st.session_state.temp_counts)} pending saves")
-            
-            # Show unique batches in pending
-            unique_batches = set(c.get('batch_no', '') for c in st.session_state.temp_counts if c.get('batch_no'))
-            if unique_batches:
-                st.caption(f"📦 Batches pending: {', '.join(sorted(unique_batches))}")
-            
-    except Exception as e:
-        st.error(f"Error loading progress: {str(e)}")
-
-def detailed_counting_interface(transaction_id: int, warehouse_id: int):
-    """Detailed counting interface with all features"""
-    st.info("📋 Detailed counting mode - includes batch details, variance analysis, etc.")
+    with col4:
+        st.metric("Total Batches", summary['total_batches'])
     
-    # Use existing interface for now
-    product_search_and_count_enhanced(transaction_id)
-    
-    st.subheader("📊 Progress")
-    show_counting_progress_enhanced(transaction_id)
-
-# ============== LEGACY FUNCTIONS (kept for compatibility) ==============
-
-def product_search_and_count_enhanced(transaction_id: int):
-    """Legacy enhanced product search - to be replaced"""
-    st.warning("Using legacy interface - switch to Fast mode for better performance")
-
-def show_counting_progress_enhanced(transaction_id: int):
-    """Legacy progress display - to be replaced"""
-    try:
-        progress = audit_service.get_transaction_progress(transaction_id)
-        recent_counts = audit_service.get_recent_counts(transaction_id, limit=5)
+    if st.session_state.new_items_list:
+        # Product distribution
+        st.markdown("#### 📈 Top Products by Quantity")
         
-        col1, col2 = st.columns(2)
+        # Group by product
+        product_qty = {}
+        for item in st.session_state.new_items_list:
+            product = item.get('product_name', 'Unknown')
+            qty = item.get('actual_quantity', 0)
+            product_qty[product] = product_qty.get(product, 0) + qty
         
-        with col1:
-            st.metric("Items Counted", progress.get('items_counted', 0))
+        # Sort and display top 10
+        sorted_products = sorted(product_qty.items(), key=lambda x: x[1], reverse=True)[:10]
         
-        with col2:
-            st.metric("Total Value", f"${progress.get('total_value', 0):,.2f}")
-            
-    except Exception as e:
-        st.error(f"Error loading progress: {str(e)}")
-
-# ============== MAIN EXECUTION ==============
+        df = pd.DataFrame(sorted_products, columns=['Product', 'Total Quantity'])
+        st.bar_chart(df.set_index('Product'))
+        
+        # Location distribution
+        st.markdown("#### 📍 Items by Location")
+        
+        location_count = {}
+        for item in st.session_state.new_items_list:
+            zone = item.get('zone_name', 'Unknown')
+            location_count[zone] = location_count.get(zone, 0) + 1
+        
+        df_location = pd.DataFrame(location_count.items(), columns=['Zone', 'Count'])
+        st.bar_chart(df_location.set_index('Zone'))
 
 if __name__ == "__main__":
-    # Track actions
-    st.session_state.action_count = st.session_state.get('action_count', 0) + 1
-    
-    # Run main app
     main()

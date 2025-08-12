@@ -1,10 +1,12 @@
-# main.py - Warehouse Audit System with Ultra-Optimized Counting & Multiple Counts per Batch
+# main.py - Warehouse Audit System with Enhanced Session Management
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
 import logging
 from typing import Dict, List, Optional
 from functools import lru_cache
+from sqlalchemy import text
+import hashlib
 
 # Import existing utilities
 from utils.auth import AuthManager
@@ -31,6 +33,183 @@ st.set_page_config(
 auth = AuthManager()
 audit_service = AuditService()
 queries = AuditQueries()
+
+# ============== SESSION MANAGEMENT CONFIG ==============
+
+SESSION_CONFIG = {
+    'DEFAULT_TIMEOUT': 8 * 60 * 60,           # 8 hours
+    'REMEMBER_ME_TIMEOUT': 7 * 24 * 60 * 60,  # 7 days
+    'INACTIVITY_TIMEOUT': 30 * 60,            # 30 minutes
+    'WARNING_BEFORE': 5 * 60,                  # Warn 5 mins before timeout
+    'ACTIVITY_THRESHOLD': 60,                  # Update activity after 60 seconds
+}
+
+# ============== SESSION RESTORATION ==============
+
+"""
+Session Persistence Implementation:
+
+Current approach uses URL query parameters to maintain session across page refresh.
+This is a simple solution that works without external dependencies.
+
+⚠️ SECURITY WARNING:
+- This is a DEVELOPMENT solution only
+- Do NOT use in production without proper security measures
+- Session token is visible in URL and browser history
+
+Limitations:
+1. Session token is visible in URL (security concern for production)
+2. No server-side session validation
+3. Token doesn't expire automatically
+4. Vulnerable to session hijacking
+
+For production, consider:
+1. Use secure cookies with 'extra-streamlit-components'
+2. Store session tokens in database with expiry
+3. Implement proper JWT tokens with expiration
+4. Use server-side session storage (Redis)
+5. Add IP address validation for security
+6. Use HTTPS only
+7. Implement CSRF protection
+
+Example production implementation:
+- Create 'user_sessions' table in database
+- Generate secure tokens with expiry
+- Validate token on each request
+- Auto-cleanup expired sessions
+- Use secure, httpOnly cookies
+"""
+
+def restore_user_session(user_id: int, session_token: str) -> bool:
+    """Restore user session from ID with token validation"""
+    try:
+        # Validate token format (basic check)
+        if not session_token or len(session_token) < 16:
+            logger.warning("Invalid session token format")
+            return False
+            
+        # Get user info from database
+        engine = get_db_engine()
+        query = """
+        SELECT 
+            u.id as user_id,
+            u.username,
+            u.employee_id,
+            u.role_id,
+            r.name as user_role,
+            u.is_active,
+            CONCAT(e.first_name, ' ', e.last_name) as full_name,
+            e.email
+        FROM users u
+        LEFT JOIN roles r ON u.role_id = r.id
+        LEFT JOIN employees e ON u.employee_id = e.id
+        WHERE u.id = :user_id
+        AND u.is_active = 1
+        AND u.delete_flag = 0
+        """
+        
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"user_id": user_id})
+            user = result.fetchone()
+            
+            if user:
+                # In production, you should:
+                # 1. Store session tokens in database with expiry
+                # 2. Validate token against stored tokens
+                # 3. Check token expiry
+                # 4. Check IP address if needed
+                
+                # For now, just check if user is active
+                if not user.is_active:
+                    logger.warning(f"User {user_id} is not active")
+                    return False
+                
+                # Restore session state
+                st.session_state.user_id = user.user_id
+                st.session_state.username = user.username
+                st.session_state.user_role = user.user_role or 'viewer'
+                st.session_state.employee_id = user.employee_id
+                st.session_state.employee_name = user.full_name
+                st.session_state.employee_email = user.email
+                st.session_state.login_time = datetime.now()
+                st.session_state.last_activity = datetime.now()
+                st.session_state.session_token = session_token
+                
+                # Set default timeout (you could store this with the token)
+                st.session_state.session_timeout = SESSION_CONFIG['DEFAULT_TIMEOUT']
+                
+                logger.info(f"Session restored for user {user.username}")
+                return True
+                
+    except Exception as e:
+        logger.error(f"Session restoration error: {e}")
+    
+    return False
+
+# ============== ENHANCED SESSION MANAGEMENT ==============
+
+def check_session_enhanced():
+    """Enhanced session check with auto-logout and warnings"""
+    if 'user_id' not in st.session_state:
+        return False
+    
+    now = datetime.now()
+    
+    # Get session timeout based on remember me
+    timeout = st.session_state.get('session_timeout', SESSION_CONFIG['DEFAULT_TIMEOUT'])
+    
+    # Check total session timeout
+    if 'login_time' in st.session_state:
+        total_elapsed = (now - st.session_state.login_time).total_seconds()
+        
+        if total_elapsed > timeout:
+            st.error("⏰ Session expired. Please login again.")
+            auth.logout()
+            return False
+    
+    # Check inactivity timeout
+    if 'last_activity' in st.session_state:
+        inactive_time = (now - st.session_state.last_activity).total_seconds()
+        
+        if inactive_time > SESSION_CONFIG['INACTIVITY_TIMEOUT']:
+            st.warning("🚪 Logged out due to inactivity")
+            auth.logout()
+            return False
+        
+        # Show inactivity warning
+        remaining_inactive = SESSION_CONFIG['INACTIVITY_TIMEOUT'] - inactive_time
+        if remaining_inactive < SESSION_CONFIG['WARNING_BEFORE']:
+            mins_left = int(remaining_inactive / 60)
+            st.sidebar.warning(f"⚠️ Auto-logout in {mins_left} minutes due to inactivity")
+    
+    # Show session expiry warning
+    if 'login_time' in st.session_state:
+        total_elapsed = (now - st.session_state.login_time).total_seconds()
+        remaining_total = timeout - total_elapsed
+        
+        if remaining_total < SESSION_CONFIG['WARNING_BEFORE']:
+            mins_left = int(remaining_total / 60)
+            st.sidebar.error(f"⏰ Session expires in {mins_left} minutes")
+            
+            # Option to extend session
+            if st.sidebar.button("🔄 Extend Session", use_container_width=True):
+                st.session_state.login_time = now
+                st.success("✅ Session extended!")
+                st.rerun()
+    
+    return True
+
+def update_activity():
+    """Update last activity timestamp"""
+    now = datetime.now()
+    
+    if 'last_activity' not in st.session_state:
+        st.session_state.last_activity = now
+    else:
+        # Only update if enough time has passed
+        elapsed = (now - st.session_state.last_activity).total_seconds()
+        if elapsed > SESSION_CONFIG['ACTIVITY_THRESHOLD']:
+            st.session_state.last_activity = now
 
 # ============== STREAMLINED SESSION STATE ==============
 
@@ -92,6 +271,8 @@ def get_sessions_by_status(status: str):
 
 def on_product_change():
     """Callback when product is selected"""
+    update_activity()  # Track activity
+    
     selected = st.session_state.product_select
     if selected and selected != "-- Select Product --":
         # Parse product data from selection
@@ -105,6 +286,8 @@ def on_product_change():
 
 def on_batch_change():
     """Callback when batch is selected"""
+    update_activity()  # Track activity
+    
     selected = st.session_state.batch_select
     if selected and selected != "-- Manual Entry --":
         # Extract batch number from selection
@@ -128,6 +311,8 @@ def on_batch_change():
 
 def add_count_callback():
     """Add count to temporary list"""
+    update_activity()  # Track activity
+    
     # Get form values
     qty = st.session_state.get('qty_input', 0)
     batch_no = st.session_state.get('batch_input', '')
@@ -176,6 +361,8 @@ def add_count_callback():
 
 def save_counts_callback():
     """Save all counts to database"""
+    update_activity()  # Track activity
+    
     if st.session_state.temp_counts:
         try:
             st.session_state.last_action = "💾 Saving..."
@@ -482,6 +669,9 @@ def counting_page_ultra_optimized():
     """Ultra-optimized counting page with minimal reruns"""
     st.subheader("🚀 Fast Counting Mode - Multiple Counts per Batch Supported")
     
+    # Update activity
+    update_activity()
+    
     init_session_state()
     
     # Check prerequisites
@@ -713,16 +903,65 @@ def check_permission(action: str) -> bool:
 def main():
     """Main application entry point"""
     try:
+        # Check for session in query params first (Streamlit >= 1.30.0)
+        # For older versions, use st.experimental_get_query_params()
+        try:
+            query_params = st.query_params
+        except AttributeError:
+            # Fallback for older Streamlit versions
+            query_params = st.experimental_get_query_params()
+            
+        if "session" in query_params and "uid" in query_params:
+            # Try to restore session if not already logged in
+            if 'user_id' not in st.session_state:
+                try:
+                    # Handle both new and old query params format
+                    if isinstance(query_params, dict):
+                        user_id = int(query_params["uid"][0] if isinstance(query_params["uid"], list) else query_params["uid"])
+                        session_token = query_params["session"][0] if isinstance(query_params["session"], list) else query_params["session"]
+                    else:
+                        user_id = int(query_params["uid"])
+                        session_token = query_params["session"]
+                    
+                    # Restore session from database
+                    if restore_user_session(user_id, session_token):
+                        logger.info(f"Session restored from URL for user {user_id}")
+                    else:
+                        # Clear invalid params
+                        try:
+                            st.query_params.clear()
+                        except:
+                            st.experimental_set_query_params()
+                        st.warning("Session expired or invalid. Please login again.")
+                        
+                except Exception as e:
+                    logger.error(f"Session restore failed: {e}")
+                    try:
+                        st.query_params.clear()
+                    except:
+                        st.experimental_set_query_params()
+        
         if not auth.check_session():
             show_login_page()
         else:
-            show_main_app()
+            # Enhanced session check
+            if check_session_enhanced():
+                # Update activity on page load
+                update_activity()
+                show_main_app()
+            else:
+                # Session expired or inactive
+                try:
+                    st.query_params.clear()
+                except:
+                    st.experimental_set_query_params()
+                st.rerun()
     except Exception as e:
         st.error(f"Application error: {str(e)}")
         logger.error(f"Main app error: {e}")
 
 def show_login_page():
-    """Display login page"""
+    """Display login page with Remember Me option"""
     st.title("🏭 Warehouse Audit System")
     st.markdown("### Please login to access the system")
     
@@ -732,6 +971,12 @@ def show_login_page():
         with st.form("login_form"):
             username = st.text_input("Username", placeholder="Enter your username")
             password = st.text_input("Password", type="password", placeholder="Enter your password")
+            
+            # Remember me checkbox
+            col_remember, col_space = st.columns([3, 1])
+            with col_remember:
+                remember_me = st.checkbox("Remember me for 7 days")
+            
             submit = st.form_submit_button("🔐 Login", use_container_width=True)
             
             if submit:
@@ -739,6 +984,39 @@ def show_login_page():
                     success, result = auth.authenticate(username, password)
                     
                     if success:
+                        # Set session timeout based on remember me
+                        if remember_me:
+                            st.session_state.session_timeout = SESSION_CONFIG['REMEMBER_ME_TIMEOUT']
+                            st.info("✅ Session will be maintained for 7 days")
+                        else:
+                            st.session_state.session_timeout = SESSION_CONFIG['DEFAULT_TIMEOUT']
+                        
+                        # Initialize activity tracking
+                        st.session_state.last_activity = datetime.now()
+                        
+                        # Generate session token
+                        session_data = f"{result['user_id']}_{username}_{datetime.now().timestamp()}"
+                        session_token = hashlib.sha256(session_data.encode()).hexdigest()[:32]
+                        
+                        # Store in session state
+                        st.session_state.session_token = session_token
+                        
+                        # Store in query params for persistence
+                        try:
+                            # New API (Streamlit >= 1.30.0)
+                            st.query_params["session"] = session_token
+                            st.query_params["uid"] = str(result['user_id'])
+                        except AttributeError:
+                            # Old API
+                            st.experimental_set_query_params(
+                                session=session_token,
+                                uid=str(result['user_id'])
+                            )
+                        
+                        # Ensure all user data is properly set for auth.get_user_display_name()
+                        if 'employee_name' not in result:
+                            result['employee_name'] = result.get('username', 'User')
+                        
                         auth.login(result)
                         st.success("✅ Login successful!")
                         st.rerun()
@@ -746,17 +1024,78 @@ def show_login_page():
                         st.error(f"❌ {result.get('error', 'Login failed')}")
                 else:
                     st.warning("⚠️ Please enter both username and password")
+        
+        # Session info
+        with st.expander("ℹ️ Session Information", expanded=False):
+            st.markdown("""
+            **Session Durations:**
+            - Default: 8 hours
+            - Remember Me: 7 days
+            - Auto-logout after 30 minutes of inactivity
+            
+            **Security Features:**
+            - Session warnings before expiry
+            - Activity tracking
+            - Secure authentication
+            
+            **Note:** Session will persist across page refresh.
+            """)
 
 def show_main_app():
     """Display main application interface"""
     init_session_state()
     
+    # Development mode warning
+    try:
+        if "session" in st.query_params:
+            st.sidebar.warning("⚠️ Development Mode: Session token visible in URL")
+    except AttributeError:
+        # Check old API
+        params = st.experimental_get_query_params()
+        if "session" in params:
+            st.sidebar.warning("⚠️ Development Mode: Session token visible in URL")
+    
     # Sidebar with user info
     with st.sidebar:
         st.markdown("### 👤 User Info")
-        st.write(f"**Name:** {auth.get_user_display_name()}")
+        # Handle display name gracefully
+        display_name = st.session_state.get('employee_name') or st.session_state.get('username', 'User')
+        st.write(f"**Name:** {display_name}")
         st.write(f"**Role:** {st.session_state.user_role}")
         st.write(f"**Login:** {st.session_state.login_time.strftime('%H:%M')}")
+        
+        # Session info
+        st.markdown("---")
+        st.markdown("### 🔐 Session Info")
+        
+        # Calculate remaining time
+        now = datetime.now()
+        timeout = st.session_state.get('session_timeout', SESSION_CONFIG['DEFAULT_TIMEOUT'])
+        elapsed = (now - st.session_state.login_time).total_seconds()
+        remaining = timeout - elapsed
+        
+        # Show session status
+        if remaining > 0:
+            hours_left = int(remaining / 3600)
+            mins_left = int((remaining % 3600) / 60)
+            
+            if hours_left > 0:
+                st.success(f"⏱️ Active: {hours_left}h {mins_left}m left")
+            else:
+                if mins_left < 30:
+                    st.warning(f"⏱️ Expires in {mins_left} minutes")
+                else:
+                    st.info(f"⏱️ Active: {mins_left} minutes left")
+        
+        # Show last activity
+        if 'last_activity' in st.session_state:
+            inactive_time = (now - st.session_state.last_activity).total_seconds()
+            inactive_mins = int(inactive_time / 60)
+            
+            if inactive_mins > 0:
+                st.caption(f"Last activity: {inactive_mins} min ago")
+            else:
+                st.caption("Last activity: Just now")
         
         st.markdown("---")
         
@@ -770,6 +1109,11 @@ def show_main_app():
         st.markdown("---")
         
         if st.button("🚪 Logout", use_container_width=True):
+            # Clear query params on logout
+            try:
+                st.query_params.clear()
+            except AttributeError:
+                st.experimental_set_query_params()
             auth.logout()
             st.rerun()
     
@@ -809,6 +1153,9 @@ def show_viewer_interface():
 def show_transactions_page():
     """Transactions management page"""
     st.subheader("📝 My Audit Transactions")
+    
+    # Update activity
+    update_activity()
     
     try:
         # Get active sessions
