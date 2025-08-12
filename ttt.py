@@ -1,4 +1,4 @@
-# main.py - Warehouse Audit System with Ultra-Optimized Counting & Multiple Counts per Batch
+# main.py - Warehouse Audit System with Ultra-Optimized Counting
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -52,9 +52,6 @@ def init_session_state():
         # Cache keys
         'products_map': {},
         'batches_map': {},
-        
-        # Display states
-        'show_batch_details': {},
     }
     
     for key, default in defaults.items():
@@ -196,182 +193,6 @@ def save_counts_callback():
             st.session_state.last_action_time = datetime.now()
             logger.error(f"Save error: {e}")
 
-# ============== ENHANCED DISPLAY FUNCTIONS ==============
-
-def display_batch_count_summary(transaction_id: int, product_id: int):
-    """Display summary of all counts for a product"""
-    try:
-        # Get batch count status
-        batch_counts = audit_service.get_batch_count_status(transaction_id, product_id)
-        
-        if batch_counts:
-            st.markdown("#### 📊 Count Summary by Batch")
-            
-            for batch in batch_counts:
-                col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
-                
-                with col1:
-                    st.write(f"**Batch:** {batch['batch_no']}")
-                    st.caption(f"Last: {pd.to_datetime(batch['last_counted']).strftime('%H:%M')}")
-                
-                with col2:
-                    st.metric("Records", batch.get('count_records', batch.get('count_times', 0)))
-                
-                with col3:
-                    st.metric("Total Qty", f"{batch['total_counted']:.0f}")
-                
-                with col4:
-                    locations = batch.get('locations_counted', '').split(',')
-                    st.write(f"**Locations:** {len(locations)}")
-                    st.caption(", ".join(locations[:2]) + ("..." if len(locations) > 2 else ""))
-                
-                # Show details button
-                if st.button(f"View Details", key=f"details_{batch['batch_no']}"):
-                    st.session_state.show_batch_details[f"{product_id}_{batch['batch_no']}"] = True
-                    st.rerun()
-                
-                # Show details if expanded
-                if st.session_state.show_batch_details.get(f"{product_id}_{batch['batch_no']}", False):
-                    show_batch_count_details(transaction_id, product_id, batch['batch_no'])
-                
-                st.markdown("---")
-    
-    except Exception as e:
-        st.error(f"Error loading count summary: {str(e)}")
-
-def show_batch_count_details(transaction_id: int, product_id: int, batch_no: str):
-    """Show all individual count records for a batch"""
-    with st.expander(f"📋 Count Details for Batch {batch_no}", expanded=True):
-        try:
-            # Get count history
-            details = audit_service.get_batch_count_history(transaction_id, product_id, batch_no)
-            
-            if details:
-                # Summary metrics
-                total_qty = sum(d.get('actual_quantity', 0) for d in details)
-                total_records = len(details)
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Records", total_records)
-                with col2:
-                    st.metric("Total Quantity", f"{total_qty:.0f}")
-                with col3:
-                    unique_locations = len(set(d.get('location', '') for d in details))
-                    st.metric("Locations", unique_locations)
-                
-                # Detail table
-                st.markdown("##### Individual Count Records")
-                
-                for i, detail in enumerate(details):
-                    col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 2])
-                    
-                    with col1:
-                        st.text(f"#{i+1} - {detail.get('location', 'N/A')}")
-                        st.caption(pd.to_datetime(detail['counted_date']).strftime('%m/%d %H:%M'))
-                    
-                    with col2:
-                        st.text(f"Qty: {detail.get('actual_quantity', 0):.0f}")
-                    
-                    with col3:
-                        # Calculate variance if system quantity available
-                        if 'system_quantity' in detail:
-                            variance = detail.get('actual_quantity', 0) - detail.get('system_quantity', 0)
-                        else:
-                            variance = 0
-                            
-                        if variance > 0:
-                            st.text(f"📈 +{variance:.0f}")
-                        elif variance < 0:
-                            st.text(f"📉 {variance:.0f}")
-                        else:
-                            st.text("✓ 0")
-                    
-                    with col4:
-                        st.text(detail.get('counter_name', detail.get('counted_by', 'Unknown')))
-                    
-                    with col5:
-                        if detail.get('actual_notes'):
-                            st.caption(detail['actual_notes'][:50] + ("..." if len(detail['actual_notes']) > 50 else ""))
-                    
-                    if i < len(details) - 1:
-                        st.markdown("---")
-                        
-            # Close button
-            if st.button("Close", key=f"close_{product_id}_{batch_no}"):
-                st.session_state.show_batch_details[f"{product_id}_{batch_no}"] = False
-                st.rerun()
-            
-        except Exception as e:
-            st.error(f"Error loading details: {str(e)}")
-
-def render_temp_counts_enhanced():
-    """Display temporary counts with batch grouping"""
-    if st.session_state.temp_counts:
-        st.markdown(f"### 📋 Pending Counts ({len(st.session_state.temp_counts)})")
-        
-        # Group by product and batch
-        grouped = {}
-        for count in st.session_state.temp_counts:
-            key = f"{count['product_id']}_{count['batch_no']}"
-            if key not in grouped:
-                grouped[key] = {
-                    'product_name': count['product_name'],
-                    'product_id': count['product_id'],
-                    'batch_no': count['batch_no'],
-                    'counts': []
-                }
-            grouped[key]['counts'].append(count)
-        
-        # Display grouped
-        for key, group in grouped.items():
-            total_qty = sum(c['actual_quantity'] for c in group['counts'])
-            
-            with st.expander(
-                f"{group['product_name']} - Batch: {group['batch_no'] or 'N/A'} "
-                f"({len(group['counts'])} records, Total: {total_qty:.0f})",
-                expanded=True
-            ):
-                for i, count in enumerate(group['counts']):
-                    idx = st.session_state.temp_counts.index(count)
-                    
-                    col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 1])
-                    
-                    with col1:
-                        location = f"{count['zone_name']}"
-                        if count['rack_name']:
-                            location += f"-{count['rack_name']}"
-                        if count['bin_name']:
-                            location += f"-{count['bin_name']}"
-                        st.text(f"📍 {location}")
-                        st.caption(f"Time: {count['time']}")
-                    
-                    with col2:
-                        st.text(f"Qty: {count['actual_quantity']:.0f}")
-                    
-                    with col3:
-                        variance = count['actual_quantity'] - count['system_quantity']
-                        if variance > 0:
-                            st.text(f"📈 +{variance:.0f}")
-                        elif variance < 0:
-                            st.text(f"📉 {variance:.0f}")
-                        else:
-                            st.text("✓ 0")
-                    
-                    with col4:
-                        if count.get('actual_notes'):
-                            st.caption(count['actual_notes'][:50])
-                    
-                    with col5:
-                        if st.button("❌", key=f"del_{idx}"):
-                            st.session_state.temp_counts.pop(idx)
-                            st.session_state.last_action = "🗑️ Removed count"
-                            st.session_state.last_action_time = datetime.now()
-                            st.rerun()
-                    
-                    if i < len(group['counts']) - 1:
-                        st.markdown("---")
-
 # ============== MAIN COUNTING INTERFACE ==============
 
 @st.fragment(run_every=None)
@@ -478,9 +299,50 @@ def counting_form_fragment():
             st.session_state.last_action = "🗑️ Cleared all pending counts"
             st.session_state.last_action_time = datetime.now()
 
+def render_temp_counts():
+    """Display temporary counts efficiently"""
+    if st.session_state.temp_counts:
+        st.markdown(f"### 📋 Pending Counts ({len(st.session_state.temp_counts)})")
+        
+        # Simple table display for performance
+        for i, count in enumerate(st.session_state.temp_counts):
+            col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 2, 1])
+            
+            with col1:
+                st.text(f"{count['product_name'][:30]}{'...' if len(count['product_name']) > 30 else ''}")
+                st.caption(f"Batch: {count['batch_no'] or 'N/A'}")
+            
+            with col2:
+                st.text(f"Qty: {count['actual_quantity']:.0f}")
+            
+            with col3:
+                variance = count['actual_quantity'] - count['system_quantity']
+                if variance > 0:
+                    st.text(f"📈 +{variance:.0f}")
+                elif variance < 0:
+                    st.text(f"📉 {variance:.0f}")
+                else:
+                    st.text("✓ 0")
+            
+            with col4:
+                location = f"{count['zone_name']}"
+                if count['rack_name']:
+                    location += f"-{count['rack_name']}"
+                if count['bin_name']:
+                    location += f"-{count['bin_name']}"
+                st.text(f"📍 {location}")
+                st.caption(count['time'])
+            
+            with col5:
+                if st.button("❌", key=f"del_{i}"):
+                    st.session_state.temp_counts.pop(i)
+                    st.session_state.last_action = "🗑️ Removed count"
+                    st.session_state.last_action_time = datetime.now()
+                    st.rerun()
+
 def counting_page_ultra_optimized():
     """Ultra-optimized counting page with minimal reruns"""
-    st.subheader("🚀 Fast Counting Mode - Multiple Counts per Batch Supported")
+    st.subheader("🚀 Fast Counting Mode")
     
     init_session_state()
     
@@ -530,8 +392,8 @@ def counting_page_ultra_optimized():
             else:
                 st.info(st.session_state.last_action)
     
-    # Display temporary counts with enhanced grouping
-    render_temp_counts_enhanced()
+    # Display temporary counts
+    render_temp_counts()
     
     st.markdown("### 📦 Product Selection")
     
@@ -548,13 +410,10 @@ def counting_page_ultra_optimized():
         # Get count info
         count_info = count_map.get(p['product_id'], {})
         counted_qty = count_info.get('total_counted', 0)
-        count_records = count_info.get('count_records', 0)
         
         # Check temp counts
         temp_qty = sum(tc['actual_quantity'] for tc in st.session_state.temp_counts 
                        if tc.get('product_id') == p['product_id'])
-        temp_records = len([tc for tc in st.session_state.temp_counts 
-                           if tc.get('product_id') == p['product_id']])
         
         # Determine status
         system_qty = p.get('total_quantity', 0)
@@ -572,7 +431,7 @@ def counting_page_ultra_optimized():
         if len(p.get('product_name', '')) > 40:
             display += "..."
         if counted_qty > 0:
-            display += f" [{count_records} records, {counted_qty:.0f}/{system_qty:.0f}]"
+            display += f" [{counted_qty:.0f}/{system_qty:.0f}]"
         
         product_options.append(display)
         products_map[display] = p
@@ -595,14 +454,6 @@ def counting_page_ultra_optimized():
             get_warehouse_products.clear()
             get_count_summary.clear()
             st.rerun()
-    
-    # Show count summary for selected product
-    if st.session_state.selected_product and 'product_id' in st.session_state.selected_product:
-        # Check if product already has counts
-        product_count_info = count_map.get(st.session_state.selected_product['product_id'], {})
-        if product_count_info.get('count_records', 0) > 0:
-            with st.expander("📊 View Existing Counts for This Product", expanded=False):
-                display_batch_count_summary(selected_tx['id'], st.session_state.selected_product['product_id'])
     
     # Batch selector (only show if product selected)
     if st.session_state.selected_product:
@@ -648,8 +499,6 @@ def counting_page_ultra_optimized():
                 on_change=on_batch_change,
                 help="🔴 Expired | 🟡 Expiring Soon (<90 days) | 🟢 Normal"
             )
-            
-            st.info("💡 **Multiple Counts Allowed**: You can count the same batch multiple times from different locations/boxes")
         
         st.markdown("### ✏️ Count Entry")
     
@@ -765,7 +614,7 @@ def show_main_app():
         st.info("Fast Counting Mode Active")
         st.caption("• Minimal page reloads")
         st.caption("• Batch operations")
-        st.caption("• Multiple counts per batch")
+        st.caption("• Isolated components")
         
         st.markdown("---")
         

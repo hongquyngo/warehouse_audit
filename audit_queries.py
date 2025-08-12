@@ -711,3 +711,76 @@ class AuditQueries:
     AND at.status = 'draft'
     AND acd.delete_flag = 0
     """
+
+        # Modified queries in audit_queries.py to handle multiple counts per batch
+
+    # Update this query to show individual count records
+    GET_BATCH_COUNT_STATUS = """
+    SELECT 
+        batch_no,
+        COUNT(*) as count_records,  -- Number of count records
+        SUM(actual_quantity) as total_counted,  -- Total quantity counted
+        MAX(counted_date) as last_counted,
+        GROUP_CONCAT(DISTINCT CONCAT(zone_name, '-', rack_name, '-', bin_name)) as locations_counted
+    FROM audit_count_details
+    WHERE transaction_id = :transaction_id
+    AND product_id = :product_id
+    AND delete_flag = 0
+    GROUP BY batch_no
+    """
+
+    # Show all individual count records for a batch
+    GET_BATCH_COUNT_DETAILS = """
+    SELECT 
+        acd.id,
+        acd.actual_quantity,
+        acd.counted_date,
+        u.username as counted_by,
+        CONCAT(e.first_name, ' ', e.last_name) as counter_name,
+        acd.actual_notes,
+        CONCAT(acd.zone_name, '-', acd.rack_name, '-', acd.bin_name) as location,
+        acd.system_quantity,
+        (acd.actual_quantity - acd.system_quantity) as variance
+    FROM audit_count_details acd
+    JOIN users u ON acd.created_by_user_id = u.id
+    LEFT JOIN employees e ON u.employee_id = e.id
+    WHERE acd.transaction_id = :transaction_id
+    AND acd.product_id = :product_id
+    AND acd.batch_no = :batch_no
+    AND acd.delete_flag = 0
+    ORDER BY acd.counted_date DESC
+    """
+
+    # Modified to show count records instead of just sum
+    GET_TRANSACTION_COUNT_SUMMARY = """
+    SELECT 
+        acd.product_id,
+        p.name as product_name,
+        p.pt_code,
+        COUNT(DISTINCT acd.batch_no) as batches_counted,
+        COUNT(*) as count_records,  -- Total count records
+        SUM(acd.actual_quantity) as total_counted,
+        MAX(acd.counted_date) as last_counted,
+        COUNT(DISTINCT CONCAT(acd.zone_name, '-', acd.rack_name, '-', acd.bin_name)) as locations_counted
+    FROM audit_count_details acd
+    LEFT JOIN products p ON acd.product_id = p.id
+    WHERE acd.transaction_id = :transaction_id
+    AND acd.delete_flag = 0
+    GROUP BY acd.product_id, p.name, p.pt_code
+    """
+
+    # Get detailed counts by location for a product
+    GET_PRODUCT_LOCATION_COUNTS = """
+    SELECT 
+        CONCAT(zone_name, '-', rack_name, '-', bin_name) as location,
+        batch_no,
+        COUNT(*) as count_times,
+        SUM(actual_quantity) as total_quantity,
+        MAX(counted_date) as last_counted
+    FROM audit_count_details
+    WHERE transaction_id = :transaction_id
+    AND product_id = :product_id
+    AND delete_flag = 0
+    GROUP BY zone_name, rack_name, bin_name, batch_no
+    ORDER BY location, batch_no
+    """

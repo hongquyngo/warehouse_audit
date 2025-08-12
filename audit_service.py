@@ -424,57 +424,32 @@ class AuditService:
     # ============== OPTIMIZED COUNT DETAILS MANAGEMENT ==============
     
     def save_count_detail(self, count_data: Dict) -> bool:
-        """Save individual count detail"""
+        """Save individual count detail - ALWAYS CREATE NEW RECORD"""
         try:
             # Validate count data
             if count_data.get('actual_quantity', 0) < 0:
                 raise CountValidationException("Actual quantity cannot be negative")
             
-            # Check if this product already counted in this transaction
-            existing_query = self.queries.CHECK_EXISTING_COUNT
-            existing_params = {
+            # ALWAYS INSERT NEW - No checking for existing
+            # This allows multiple counts for same batch at different locations/times
+            query = self.queries.INSERT_COUNT_DETAIL
+            params = {
                 'transaction_id': count_data['transaction_id'],
                 'product_id': count_data.get('product_id'),
                 'batch_no': count_data.get('batch_no', ''),
-                'is_new_item': count_data.get('is_new_item', False)
+                'expired_date': count_data.get('expired_date'),
+                'zone_name': count_data.get('zone_name', ''),
+                'rack_name': count_data.get('rack_name', ''),
+                'bin_name': count_data.get('bin_name', ''),
+                'location_notes': count_data.get('location_notes', ''),
+                'system_quantity': count_data.get('system_quantity', 0),
+                'system_value_usd': count_data.get('system_value_usd', 0),
+                'actual_quantity': count_data['actual_quantity'],
+                'actual_notes': count_data.get('actual_notes', ''),
+                'is_new_item': count_data.get('is_new_item', False),
+                'created_by_user_id': count_data['created_by_user_id'],
+                'counted_date': datetime.now()
             }
-            
-            existing = self._execute_query(existing_query, existing_params, fetch='one')
-            
-            if existing:
-                # Update existing count
-                query = self.queries.UPDATE_COUNT_DETAIL
-                params = {
-                    'count_id': existing['id'],
-                    'actual_quantity': count_data['actual_quantity'],
-                    'actual_notes': count_data.get('actual_notes', ''),
-                    'zone_name': count_data.get('zone_name', ''),
-                    'rack_name': count_data.get('rack_name', ''),
-                    'bin_name': count_data.get('bin_name', ''),
-                    'location_notes': count_data.get('location_notes', ''),
-                    'modified_by_user_id': count_data['created_by_user_id'],
-                    'modified_date': datetime.now()
-                }
-            else:
-                # Insert new count
-                query = self.queries.INSERT_COUNT_DETAIL
-                params = {
-                    'transaction_id': count_data['transaction_id'],
-                    'product_id': count_data.get('product_id'),
-                    'batch_no': count_data.get('batch_no', ''),
-                    'expired_date': count_data.get('expired_date'),
-                    'zone_name': count_data.get('zone_name', ''),
-                    'rack_name': count_data.get('rack_name', ''),
-                    'bin_name': count_data.get('bin_name', ''),
-                    'location_notes': count_data.get('location_notes', ''),
-                    'system_quantity': count_data.get('system_quantity', 0),
-                    'system_value_usd': count_data.get('system_value_usd', 0),
-                    'actual_quantity': count_data['actual_quantity'],
-                    'actual_notes': count_data.get('actual_notes', ''),
-                    'is_new_item': count_data.get('is_new_item', False),
-                    'created_by_user_id': count_data['created_by_user_id'],
-                    'counted_date': datetime.now()
-                }
             
             self._execute_query(query, params, fetch='none')
             
@@ -484,9 +459,10 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error saving count detail: {e}")
             raise e
-    
+
+
     def save_batch_counts(self, count_list: List[Dict]) -> Tuple[int, List[str]]:
-        """Optimized batch save with better error handling"""
+        """Optimized batch save - ALWAYS INSERT NEW RECORDS"""
         saved_count = 0
         errors = []
         transaction_id = None
@@ -520,54 +496,27 @@ class AuditService:
                                 count_data['rack_name'] = ""
                                 count_data['bin_name'] = ""
                         
-                        # Check existing
-                        existing_query = self.queries.CHECK_EXISTING_COUNT
-                        existing_params = {
+                        # ALWAYS INSERT NEW - NO CHECK FOR EXISTING
+                        # This allows multiple counts per batch
+                        insert_query = self.queries.INSERT_COUNT_DETAIL
+                        insert_params = {
                             'transaction_id': count_data['transaction_id'],
                             'product_id': count_data.get('product_id'),
                             'batch_no': count_data.get('batch_no', ''),
-                            'is_new_item': count_data.get('is_new_item', False)
+                            'expired_date': count_data.get('expired_date'),
+                            'zone_name': count_data.get('zone_name', ''),
+                            'rack_name': count_data.get('rack_name', ''),
+                            'bin_name': count_data.get('bin_name', ''),
+                            'location_notes': count_data.get('location_notes', ''),
+                            'system_quantity': count_data.get('system_quantity', 0),
+                            'system_value_usd': count_data.get('system_value_usd', 0),
+                            'actual_quantity': count_data['actual_quantity'],
+                            'actual_notes': count_data.get('actual_notes', ''),
+                            'is_new_item': count_data.get('is_new_item', False),
+                            'created_by_user_id': count_data['created_by_user_id'],
+                            'counted_date': datetime.now()
                         }
-                        
-                        result = conn.execute(text(existing_query), existing_params)
-                        existing = result.fetchone()
-                        
-                        if existing:
-                            # Update existing
-                            update_query = self.queries.UPDATE_COUNT_DETAIL
-                            update_params = {
-                                'count_id': existing.id,
-                                'actual_quantity': count_data['actual_quantity'],
-                                'actual_notes': count_data.get('actual_notes', ''),
-                                'zone_name': count_data.get('zone_name', ''),
-                                'rack_name': count_data.get('rack_name', ''),
-                                'bin_name': count_data.get('bin_name', ''),
-                                'location_notes': count_data.get('location_notes', ''),
-                                'modified_by_user_id': count_data['created_by_user_id'],
-                                'modified_date': datetime.now()
-                            }
-                            conn.execute(text(update_query), update_params)
-                        else:
-                            # Insert new
-                            insert_query = self.queries.INSERT_COUNT_DETAIL
-                            insert_params = {
-                                'transaction_id': count_data['transaction_id'],
-                                'product_id': count_data.get('product_id'),
-                                'batch_no': count_data.get('batch_no', ''),
-                                'expired_date': count_data.get('expired_date'),
-                                'zone_name': count_data.get('zone_name', ''),
-                                'rack_name': count_data.get('rack_name', ''),
-                                'bin_name': count_data.get('bin_name', ''),
-                                'location_notes': count_data.get('location_notes', ''),
-                                'system_quantity': count_data.get('system_quantity', 0),
-                                'system_value_usd': count_data.get('system_value_usd', 0),
-                                'actual_quantity': count_data['actual_quantity'],
-                                'actual_notes': count_data.get('actual_notes', ''),
-                                'is_new_item': count_data.get('is_new_item', False),
-                                'created_by_user_id': count_data['created_by_user_id'],
-                                'counted_date': datetime.now()
-                            }
-                            conn.execute(text(insert_query), insert_params)
+                        conn.execute(text(insert_query), insert_params)
                         
                         saved_count += 1
                         
@@ -591,6 +540,8 @@ class AuditService:
             logger.error(f"Error in batch save: {e}")
             raise e
     
+    
+
     def get_recent_counts(self, transaction_id: int, limit: int = 10) -> List[Dict]:
         """Get recent counts for transaction"""
         try:
