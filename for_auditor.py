@@ -321,13 +321,17 @@ def show_transaction_selector():
         return None
 
 def show_entry_form():
-    """Show simplified entry form"""
+    """Show simplified entry form with auto clear"""
     st.markdown("### ✏️ Add Item")
+    
+    # Initialize form key if not exists
+    if 'form_key' not in st.session_state:
+        st.session_state.form_key = 0
     
     # Load all products once
     all_products = get_all_products()
     
-    # ✅ PRODUCT SELECTOR OUTSIDE FORM - để có thể update real-time
+    # PRODUCT SELECTOR OUTSIDE FORM
     st.markdown("**Product (if exists in ERP)**")
     
     # Create options for selectbox with ALL products
@@ -352,9 +356,10 @@ def show_entry_form():
     selected_product_key = st.selectbox(
         "Select Product",
         options=list(product_options.keys()),
-        key="product_selector_widget",
+        key=f"product_selector_widget_{st.session_state.form_key}",
         help="Type to search in the dropdown. Select 'Not in ERP' if product doesn't exist",
-        index=list(product_options.keys()).index(st.session_state.selected_product_key)
+        index=0 if st.session_state.selected_product_key == "-- Not in ERP / New Product --" 
+               else list(product_options.keys()).index(st.session_state.selected_product_key)
     )
     
     # Update session state
@@ -367,8 +372,8 @@ def show_entry_form():
     else:
         st.info("ℹ️ Product not in ERP - Enter details manually below")
     
-    # Main form
-    with st.form("new_item_form", clear_on_submit=False):  # Note: clear_on_submit=False
+    # Main form with dynamic key for reset
+    with st.form(f"new_item_form_{st.session_state.form_key}", clear_on_submit=True):
         # Form fields
         col1, col2 = st.columns(2)
         
@@ -433,6 +438,7 @@ def show_entry_form():
             quantity = st.number_input(
                 "Quantity*", 
                 min_value=0.0, 
+                value=0.0,  # Default value
                 step=1.0, 
                 format="%.2f",
                 help="Physical quantity found in warehouse"
@@ -444,15 +450,15 @@ def show_entry_form():
                 help="Leave empty if no expiry date"
             )
             
-            # Location inputs
+            # Location inputs with default values
             st.markdown("**Location**")
             col_z, col_r, col_b = st.columns(3)
             with col_z:
-                zone = st.text_input("Zone", value=st.session_state.default_location['zone'])
+                zone = st.text_input("Zone", value=st.session_state.default_location.get('zone', ''))
             with col_r:
-                rack = st.text_input("Rack", value=st.session_state.default_location['rack'])
+                rack = st.text_input("Rack", value=st.session_state.default_location.get('rack', ''))
             with col_b:
-                bin_name = st.text_input("Bin", value=st.session_state.default_location['bin'])
+                bin_name = st.text_input("Bin", value=st.session_state.default_location.get('bin', ''))
         
         notes = st.text_area(
             "Additional Notes", 
@@ -522,12 +528,16 @@ def show_entry_form():
                     else:
                         st.success(f"✅ Added: {actual_product_name} - NOT IN ERP (Qty: {quantity})")
                     
-                    # Update default location
+                    # Update default location for next entry
                     st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
                     
                     # Reset product selector to default
                     st.session_state.selected_product_key = "-- Not in ERP / New Product --"
                     
+                    # Increment form key to force form reset
+                    st.session_state.form_key += 1
+                    
+                    # Short delay then rerun to clear form
                     time.sleep(0.5)
                     st.rerun()
                     
@@ -535,8 +545,9 @@ def show_entry_form():
                     st.error(f"❌ Error: {str(e)}")
         
         if reset:
-            # Reset product selector
+            # Reset product selector and form
             st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+            st.session_state.form_key += 1
             st.rerun()
 
 def show_items_preview():
