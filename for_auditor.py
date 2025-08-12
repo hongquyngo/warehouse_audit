@@ -56,6 +56,9 @@ def init_session_state():
     
     if 'form_data' not in st.session_state:
         st.session_state.form_data = {}
+    
+    if 'product_selector' not in st.session_state:
+        st.session_state.product_selector = "-- Not in ERP / New Product --"
 
 # ============== SIMPLIFIED CACHE FUNCTIONS ==============
 
@@ -324,43 +327,61 @@ def show_entry_form():
     # Load all products once
     all_products = get_all_products()
     
+    # ✅ PRODUCT SELECTOR OUTSIDE FORM - để có thể update real-time
+    st.markdown("**Product (if exists in ERP)**")
+    
+    # Create options for selectbox with ALL products
+    product_options = {"-- Not in ERP / New Product --": None}
+    
+    # Add all products to options
+    for p in all_products:
+        display_name = f"{p['pt_code']} - {p['product_name']}"
+        if p.get('brand_name'):
+            display_name += f" | {p['brand_name']}"
+        if p.get('package_size'):
+            display_name += f" ({p['package_size']})"
+        # Add Product ID at the end
+        display_name += f" |ID: {p['id']}"
+        product_options[display_name] = p
+    
+    # Store selected product in session state
+    if 'selected_product_key' not in st.session_state:
+        st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+    
+    # Product selector OUTSIDE form
+    selected_product_key = st.selectbox(
+        "Select Product",
+        options=list(product_options.keys()),
+        key="product_selector_widget",
+        help="Type to search in the dropdown. Select 'Not in ERP' if product doesn't exist",
+        index=list(product_options.keys()).index(st.session_state.selected_product_key)
+    )
+    
+    # Update session state
+    st.session_state.selected_product_key = selected_product_key
+    selected_product = product_options.get(selected_product_key)
+    
+    # Show selected product info
+    if selected_product:
+        st.success(f"✅ ERP Product Selected: {selected_product['pt_code']} - {selected_product['product_name']} (ID: {selected_product['id']})")
+    else:
+        st.info("ℹ️ Product not in ERP - Enter details manually below")
+    
     # Main form
-    with st.form("new_item_form", clear_on_submit=True):
-        # Product selection
-        st.markdown("**Product (if exists in ERP)**")
-        
-        # Create options for selectbox with ALL products
-        product_options = {"-- Not in ERP / New Product --": None}
-        
-        # Add all products to options
-        for p in all_products:
-            display_name = f"{p['pt_code']} - {p['product_name']}"
-            if p.get('brand_name'):
-                display_name += f" | {p['brand_name']}"
-            if p.get('package_size'):
-                display_name += f" ({p['package_size']})"
-            product_options[display_name] = p
-        
-        # Product selector
-        selected_product_key = st.selectbox(
-            "Select Product",
-            options=list(product_options.keys()),
-            help="Type to search in the dropdown. Select 'Not in ERP' if product doesn't exist",
-            index=0  # Default to first option
-        )
-        
-        selected_product = product_options.get(selected_product_key)
-        
-        # Show selected product info
-        if selected_product:
-            st.success(f"✅ ERP Product Selected: {selected_product['pt_code']} - {selected_product['product_name']}")
-        else:
-            st.info("ℹ️ Product not in ERP - Enter details manually below")
-        
+    with st.form("new_item_form", clear_on_submit=False):  # Note: clear_on_submit=False
         # Form fields
         col1, col2 = st.columns(2)
         
         with col1:
+            # Product ID - only show if product selected
+            if selected_product:
+                product_id_display = st.text_input(
+                    "Product ID", 
+                    value=str(selected_product.get('id', '')),
+                    disabled=True,
+                    help="Auto-filled from ERP"
+                )
+            
             # Product name - auto-filled or manual entry
             if selected_product:
                 product_name = st.text_input(
@@ -400,11 +421,13 @@ def show_entry_form():
                     value=selected_product.get('package_size', ''),
                     disabled=True
                 )
+                actual_package_size = selected_product.get('package_size', '')
             else:
                 package_size = st.text_input(
                     "Package Size", 
                     placeholder="e.g., 100 tablets, 500ml"
                 )
+                actual_package_size = package_size
         
         with col2:
             quantity = st.number_input(
@@ -452,6 +475,10 @@ def show_entry_form():
         
         # Handle form submission
         if submitted:
+            # Initialize actual_product_name if not defined (edge case)
+            if 'actual_product_name' not in locals():
+                actual_product_name = ""
+            
             if not actual_product_name:
                 st.error("❌ Product name is required!")
             elif quantity <= 0:
@@ -472,9 +499,9 @@ def show_entry_form():
                     
                     item_data = {
                         'product_name': actual_product_name,
-                        'brand': actual_brand,
+                        'brand': actual_brand if 'actual_brand' in locals() else '',
                         'batch_no': batch_no,
-                        'package_size': package_size,
+                        'package_size': actual_package_size if 'actual_package_size' in locals() else '',
                         'actual_quantity': quantity,
                         'expired_date': expired_date,
                         'zone_name': zone,
@@ -491,20 +518,25 @@ def show_entry_form():
                     
                     # Success message
                     if product_id:
-                        st.success(f"✅ Added: {selected_product['pt_code']} - {actual_product_name} (Qty: {quantity})")
+                        st.success(f"✅ Added: {selected_product['pt_code']} - {actual_product_name} (ID: {product_id}, Qty: {quantity})")
                     else:
                         st.success(f"✅ Added: {actual_product_name} - NOT IN ERP (Qty: {quantity})")
                     
                     # Update default location
                     st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
                     
-                    time.sleep(1)
+                    # Reset product selector to default
+                    st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+                    
+                    time.sleep(0.5)
                     st.rerun()
                     
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
         
         if reset:
+            # Reset product selector
+            st.session_state.selected_product_key = "-- Not in ERP / New Product --"
             st.rerun()
 
 def show_items_preview():
@@ -519,6 +551,7 @@ def show_items_preview():
     for item in st.session_state.new_items_list:
         items_data.append({
             'Type': '📦 ERP' if item.get('product_id') else '❓ New',
+            'ID': item.get('product_id', '-'),
             'Product': item.get('product_name', ''),
             'PT Code': item.get('reference_pt_code', '-'),
             'Brand': item.get('brand', '-'),
@@ -533,23 +566,25 @@ def show_items_preview():
     
     # Display with action column
     for idx, row in df.iterrows():
-        col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([1, 3, 2, 2, 2, 2, 2, 1])
+        col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns([1, 1, 3, 2, 2, 2, 2, 2, 1])
         
         with col1:
             st.write(row['Type'])
         with col2:
-            st.write(row['Product'])
+            st.write(row['ID'])
         with col3:
-            st.write(row['PT Code'])
+            st.write(row['Product'])
         with col4:
-            st.write(row['Brand'])
+            st.write(row['PT Code'])
         with col5:
-            st.write(row['Batch'])
+            st.write(row['Brand'])
         with col6:
-            st.write(row['Quantity'])
+            st.write(row['Batch'])
         with col7:
-            st.write(row['Location'])
+            st.write(row['Quantity'])
         with col8:
+            st.write(row['Location'])
+        with col9:
             if st.button("🗑️", key=f"del_{row['temp_id']}", help="Remove"):
                 remove_item(row['temp_id'])
                 st.rerun()
@@ -580,6 +615,7 @@ def export_items_to_csv():
             'PT Code': item.get('reference_pt_code', ''),
             'Brand': item.get('brand', ''),
             'Batch Number': item.get('batch_no', ''),
+            'Package Size': item.get('package_size', ''),
             'Quantity': item.get('actual_quantity', 0),
             'Expiry Date': expiry_date,
             'Zone': item.get('zone_name', ''),
@@ -760,7 +796,17 @@ def show_main_app():
                 if st.session_state.new_items_list:
                     for item in st.session_state.new_items_list[-5:]:  # Show last 5
                         status = "📦" if item.get('product_id') else "❓"
-                        st.caption(f"{status} {item['product_name'][:20]}... - Qty: {item['actual_quantity']:.0f}")
+                        product_info = f"{item['product_name'][:20]}..."
+                        if item.get('product_id'):
+                            product_info += f" (ID: {item['product_id']})"
+                        st.caption(f"{status} {product_info} - Qty: {item['actual_quantity']:.0f}")
+                
+                # Clear cache button
+                st.markdown("---")
+                if st.button("🔄 Clear Cache", help="Clear cached products and reload"):
+                    st.cache_data.clear()
+                    st.success("Cache cleared!")
+                    st.rerun()
         
         with tab2:
             # Items preview
