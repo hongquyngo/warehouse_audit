@@ -1,4 +1,5 @@
-# main_new_item_optimized.py - Optimized New Item Management for Warehouse Audit
+# main_warehouse_physical_count.py - Warehouse Physical Count Management
+# Records both existing products found in warehouse and new items not in ERP
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Page config
 st.set_page_config(
-    page_title="New Item Management - Warehouse Audit",
+    page_title="Warehouse Physical Count",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -132,6 +133,115 @@ def get_products_by_brand(brand_id: Optional[int] = None):
         st.error(f"Database error: {str(e)}")
         return []
 
+@st.cache_data(ttl=900)
+def search_products_enhanced(search_term: str, brand_id: Optional[int] = None):
+    """Enhanced search products by PT code or name with optional brand filter"""
+    try:
+        # Build query with optional brand filter
+        if brand_id:
+            query = """
+            SELECT 
+                p.id,
+                p.name as product_name,
+                p.pt_code,
+                COALESCE(p.package_size, '') as package_size,
+                p.brand_id,
+                b.brand_name
+            FROM products p
+            LEFT JOIN brands b ON p.brand_id = b.id
+            WHERE p.delete_flag = 0
+            AND p.brand_id = :brand_id
+            AND (
+                p.pt_code LIKE :search_term
+                OR p.name LIKE :search_term
+            )
+            ORDER BY 
+                CASE 
+                    WHEN p.pt_code = :exact_term THEN 1
+                    WHEN p.pt_code LIKE :start_term THEN 2
+                    ELSE 3
+                END,
+                p.pt_code,
+                p.name
+            LIMIT 50
+            """
+            params = {
+                'brand_id': brand_id,
+                'search_term': f'%{search_term}%',
+                'exact_term': search_term,
+                'start_term': f'{search_term}%'
+            }
+        else:
+            # Search all products
+            query = """
+            SELECT 
+                p.id,
+                p.name as product_name,
+                p.pt_code,
+                COALESCE(p.package_size, '') as package_size,
+                p.brand_id,
+                b.brand_name
+            FROM products p
+            LEFT JOIN brands b ON p.brand_id = b.id
+            WHERE p.delete_flag = 0
+            AND (
+                p.pt_code LIKE :search_term
+                OR p.name LIKE :search_term
+            )
+            ORDER BY 
+                CASE 
+                    WHEN p.pt_code = :exact_term THEN 1
+                    WHEN p.pt_code LIKE :start_term THEN 2
+                    ELSE 3
+                END,
+                p.pt_code,
+                p.name
+            LIMIT 50
+            """
+            params = {
+                'search_term': f'%{search_term}%',
+                'exact_term': search_term,
+                'start_term': f'{search_term}%'
+            }
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), params)
+            products = [dict(row._mapping) for row in result.fetchall()]
+            logger.info(f"Search '{search_term}' returned {len(products)} products")
+            return products
+    except Exception as e:
+        logger.error(f"Error searching products: {e}")
+        return []
+
+@st.cache_data(ttl=1800)
+def get_recent_products(limit: int = 100):
+    """Get recent/popular products as default options"""
+    try:
+        query = """
+        SELECT 
+            p.id,
+            p.name as product_name,
+            p.pt_code,
+            COALESCE(p.package_size, '') as package_size,
+            p.brand_id,
+            b.brand_name
+        FROM products p
+        LEFT JOIN brands b ON p.brand_id = b.id
+        WHERE p.delete_flag = 0
+        ORDER BY p.id DESC
+        LIMIT :limit
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {'limit': limit})
+            products = [dict(row._mapping) for row in result.fetchall()]
+            return products
+    except Exception as e:
+        logger.error(f"Error getting recent products: {e}")
+        return []
+
 # ============== ITEM MANAGEMENT FUNCTIONS ==============
 
 def add_new_item(item_data: Dict):
@@ -169,14 +279,17 @@ def clear_all_items():
     st.session_state.new_items_list = []
     st.session_state.item_counter = 0
 
+
 def get_items_summary() -> Dict:
-    """Get summary statistics"""
+    """Get summary statistics for physical items"""
     if not st.session_state.new_items_list:
         return {
             'total_items': 0,
             'total_quantity': 0,
             'unique_products': 0,
-            'total_batches': 0
+            'total_batches': 0,
+            'items_in_erp': 0,      # Items found in ERP product master
+            'items_not_in_erp': 0   # Items NOT in ERP product master
         }
     
     total_quantity = sum(item.get('actual_quantity', 0) for item in st.session_state.new_items_list)
@@ -184,15 +297,23 @@ def get_items_summary() -> Dict:
     total_batches = len(set((item.get('product_name', ''), item.get('batch_no', '')) 
                            for item in st.session_state.new_items_list))
     
+    # Count by whether product exists in ERP
+    items_in_erp = sum(1 for item in st.session_state.new_items_list 
+                       if item.get('product_id') is not None)
+    items_not_in_erp = len(st.session_state.new_items_list) - items_in_erp
+    
     return {
         'total_items': len(st.session_state.new_items_list),
         'total_quantity': total_quantity,
         'unique_products': unique_products,
-        'total_batches': total_batches
+        'total_batches': total_batches,
+        'items_in_erp': items_in_erp,
+        'items_not_in_erp': items_not_in_erp
     }
 
+
 def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
-    """Save all items to database"""
+    """Save all physical items found in warehouse to database"""
     if not st.session_state.new_items_list:
         return 0, ["No items to save"]
     
@@ -204,26 +325,33 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
         if expired_date:
             try:
                 if isinstance(expired_date, str):
-                    # Convert ISO format string to date
                     expired_date = datetime.fromisoformat(expired_date).date()
             except:
                 logger.warning(f"Failed to parse expiry date: {expired_date}")
                 expired_date = None
         
+        # Create appropriate notes based on whether product exists in ERP
+        if item.get('product_id'):
+            # Physical item that exists in ERP product master
+            actual_notes = f"PHYSICAL COUNT - IN ERP: {item.get('reference_pt_code', '')} - {item.get('product_name', '')} - {item.get('notes', '')}"
+        else:
+            # Physical item NOT in ERP product master
+            actual_notes = f"PHYSICAL COUNT - NOT IN ERP: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}"
+        
         count_data = {
             'transaction_id': transaction_id,
-            'product_id': None,  # New item, no product_id
+            'product_id': item.get('product_id'),  # Will be actual ID or None
             'batch_no': item.get('batch_no', ''),
             'expired_date': expired_date,
             'zone_name': item.get('zone_name', ''),
             'rack_name': item.get('rack_name', ''),
             'bin_name': item.get('bin_name', ''),
             'location_notes': item.get('location_notes', ''),
-            'system_quantity': 0,  # New item has no system quantity
-            'system_value_usd': 0,
+            'system_quantity': 0,  # Always 0 for physical count items not in ERP inventory
+            'system_value_usd': 0,  # Always 0 for physical count items not in ERP inventory
             'actual_quantity': item.get('actual_quantity', 0),
-            'actual_notes': f"NEW ITEM: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}",
-            'is_new_item': True,
+            'actual_notes': actual_notes,
+            'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
             'created_by_user_id': st.session_state.user_id
         }
         count_list.append(count_data)
@@ -236,7 +364,6 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
         clear_all_items()
     
     return saved, errors
-
 # ============== UI COMPONENTS ==============
 
 def show_header():
@@ -244,8 +371,8 @@ def show_header():
     col1, col2, col3 = st.columns([6, 2, 2])
     
     with col1:
-        st.title("📦 New Item Management")
-        st.caption("Add items found in warehouse but not in ERP system")
+        st.title("📦 Warehouse Physical Count - Items NOT in ERP Inventory")
+        st.caption("Record physical items found in warehouse that are not in ERP inventory data")
     
     with col2:
         st.metric("User", auth.get_user_display_name())
@@ -346,7 +473,7 @@ def show_transaction_selector():
 
 def show_entry_form():
     """Show optimized entry form"""
-    st.markdown("### ✏️ Add New Item")
+    st.markdown("### ✏️ Add Item")
     
     # Direct to detailed form (no mode selection)
     show_detailed_entry_form()
@@ -354,57 +481,50 @@ def show_entry_form():
 
 
 def show_detailed_entry_form():
-    """Detailed entry form with dynamic brand/product selection"""
+    """Entry form for warehouse physical items not in ERP inventory"""
     
-    # Get brands and products
+    # Get brands for optional selection
     brands = get_all_brands()
     
-    # Debug
-    if not brands:
-        st.warning("⚠️ No brands found in database. Please check database connection.")
-        logger.warning("No brands returned from database")
-    else:
-        st.caption(f"Found {len(brands)} brands in database")
-    
-    # Create brand options - filter out any None values
-    brand_options = {"-- Select Brand --": None}
+    # Create brand options
+    brand_options = {"-- Select Brand (Optional) --": None}
     for brand in brands:
-        if brand.get('brand_name'):  # Only add if brand_name exists
+        if brand.get('brand_name'):
             brand_options[brand['brand_name']] = brand['id']
     
-    # Brand/Product selection row
-    col_brand, col_product = st.columns(2)
+    # Brand and Product selection
+    col1, col2 = st.columns(2)
     
-    with col_brand:
+    with col1:
+        # Optional brand selection
         selected_brand_name = st.selectbox(
-            "Brand",
+            "Brand (Optional)",
             options=list(brand_options.keys()),
             key="brand_selector",
-            help="Select a brand to filter products"
+            help="Select a brand to filter products (optional)"
         )
         
         selected_brand_id = brand_options[selected_brand_name]
-        
-        # Update session state if brand changed
-        if selected_brand_id != st.session_state.selected_brand_id:
-            st.session_state.selected_brand_id = selected_brand_id
-            st.session_state.selected_product_id = None  # Reset product selection
     
-    with col_product:
-        # Get products based on brand filter
-        if st.session_state.selected_brand_id:
-            products = get_products_by_brand(st.session_state.selected_brand_id)
-        else:
-            products = []
+    with col2:
+        # Product search input
+        product_search = st.text_input(
+            "Search Product (PT Code or Name)",
+            key="product_search_input",
+            placeholder="Type PT code or product name..."
+        )
         
-        # Debug
-        if st.session_state.selected_brand_id and not products:
-            st.caption("No products found for selected brand")
+        # Get products based on search and/or brand filter
+        if product_search and len(product_search) >= 2:
+            products = search_products_enhanced(product_search, selected_brand_id)
+        elif selected_brand_id:
+            products = get_products_by_brand(selected_brand_id)
+        else:
+            products = get_recent_products(limit=100)
         
         # Create product options
-        product_options = {"-- Select brand first --": None}
+        product_options = {"-- Select Product (if exists in ERP) --": None}
         if products:
-            product_options = {"-- Select Product (Optional) --": None}
             for p in products:
                 display_name = f"{p['pt_code']} - {p['product_name']}"
                 if p.get('package_size'):
@@ -412,48 +532,73 @@ def show_detailed_entry_form():
                 product_options[display_name] = p
         
         selected_product_key = st.selectbox(
-            "Product (Optional - for reference)",
+            "Product (if exists in ERP)",
             options=list(product_options.keys()),
             key="product_selector",
-            help="Select a product for reference (optional)"
+            help="Select if this product exists in ERP, otherwise leave empty"
         )
         
         selected_product = product_options.get(selected_product_key)
     
+    # If product selected, show its details
+    if selected_product:
+        st.info(f"📋 ERP Product: {selected_product['pt_code']} - {selected_product['product_name']} | Brand: {selected_product.get('brand_name', 'N/A')}")
+    else:
+        st.warning("⚠️ Product not found in ERP - will be saved as completely new item")
+    
     # Main form
-    with st.form("detailed_entry_form", clear_on_submit=True):
+    with st.form("new_item_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         
         with col1:
-            # Product name - pre-fill if product selected
-            default_product_name = ""
-            default_package_size = ""
-            
+            # Product name - pre-filled if product selected, otherwise manual entry
             if selected_product:
-                default_product_name = selected_product.get('product_name', '')
-                default_package_size = selected_product.get('package_size', '')
+                product_name = st.text_input(
+                    "Product Name*", 
+                    value=selected_product.get('product_name', ''),
+                    disabled=True,
+                    help="Auto-filled from ERP product"
+                )
+                actual_product_name = selected_product.get('product_name', '')
+            else:
+                product_name = st.text_input(
+                    "Product Name*", 
+                    placeholder="Enter product name (not in ERP)"
+                )
+                actual_product_name = product_name
             
-            product_name = st.text_input(
-                "Product Name*", 
-                value=default_product_name,
-                placeholder="Enter product name"
-            )
-            
-            # Brand name - show selected brand
-            brand_name = selected_brand_name if selected_brand_name != "-- Select Brand --" else ""
-            brand_display = st.text_input(
-                "Brand", 
-                value=brand_name,
-                disabled=True,
-                help="Selected from dropdown above"
-            )
+            # Brand
+            if selected_product:
+                brand_name = st.text_input(
+                    "Brand", 
+                    value=selected_product.get('brand_name', ''),
+                    disabled=True
+                )
+                actual_brand = selected_product.get('brand_name', '')
+            else:
+                brand_name = selected_brand_name if selected_brand_name != "-- Select Brand (Optional) --" else ""
+                brand_display = st.text_input(
+                    "Brand", 
+                    value=brand_name,
+                    disabled=bool(brand_name),
+                    placeholder="Enter brand or select above"
+                )
+                actual_brand = brand_name or brand_display
             
             batch_no = st.text_input("Batch Number", placeholder="Enter batch number")
-            package_size = st.text_input(
-                "Package Size", 
-                value=default_package_size,
-                placeholder="e.g., 100 tablets"
-            )
+            
+            # Package size
+            if selected_product:
+                package_size = st.text_input(
+                    "Package Size", 
+                    value=selected_product.get('package_size', ''),
+                    disabled=True
+                )
+            else:
+                package_size = st.text_input(
+                    "Package Size", 
+                    placeholder="e.g., 100 tablets"
+                )
         
         with col2:
             quantity = st.number_input("Quantity*", min_value=0.0, step=1.0, format="%.2f")
@@ -471,16 +616,12 @@ def show_detailed_entry_form():
         
         notes = st.text_area("Additional Notes", placeholder="Any observations or special conditions")
         
-        # Reference info if product selected
-        if selected_product:
-            st.info(f"📋 Reference: {selected_product['pt_code']} - This is a NEW physical item not in system inventory")
-        
-        # Submit button
+        # Submit buttons
         col_submit, col_reset = st.columns([3, 1])
         
         with col_submit:
             submitted = st.form_submit_button(
-                "➕ Add to List",
+                "➕ Add Physical Item",
                 use_container_width=True,
                 type="primary",
                 disabled=len(st.session_state.new_items_list) >= 20
@@ -489,11 +630,26 @@ def show_detailed_entry_form():
         with col_reset:
             reset = st.form_submit_button("🔄 Reset", use_container_width=True)
         
-        if submitted and product_name and quantity > 0:
+        if submitted and quantity > 0:
             try:
+                if not actual_product_name:
+                    st.error("Product name is required!")
+                    return
+                
+                # ALL items are "new items" (found in warehouse but not in ERP inventory)
+                # Differentiate by whether they have product_id or not
+                if selected_product:
+                    # Product exists in ERP master data
+                    product_id = selected_product['id']
+                    notes_prefix = f"PHYSICAL ITEM (IN ERP): {selected_product['pt_code']} - "
+                else:
+                    # Product not in ERP master data
+                    product_id = None
+                    notes_prefix = f"PHYSICAL ITEM (NOT IN ERP): {actual_product_name} - {actual_brand} - "
+                
                 item_data = {
-                    'product_name': product_name,
-                    'brand': brand_name,
+                    'product_name': actual_product_name,
+                    'brand': actual_brand,
                     'batch_no': batch_no,
                     'package_size': package_size,
                     'actual_quantity': quantity,
@@ -501,21 +657,27 @@ def show_detailed_entry_form():
                     'zone_name': zone,
                     'rack_name': rack,
                     'bin_name': bin_name,
-                    'notes': notes,
-                    'reference_product_id': selected_product['id'] if selected_product else None,
+                    'notes': notes_prefix + notes,
+                    'product_id': product_id,  # Will be actual ID or None
+                    'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
                     'reference_pt_code': selected_product['pt_code'] if selected_product else None,
                     'created_by_user_id': st.session_state.user_id
                 }
                 
                 add_new_item(item_data)
-                st.success(f"✅ Added: {product_name}")
+                
+                if product_id:
+                    st.success(f"✅ Added physical item (found in ERP): {selected_product['pt_code']} - {actual_product_name}")
+                else:
+                    st.success(f"✅ Added physical item (NOT in ERP): {actual_product_name}")
                 
                 # Update default location
                 if zone:
                     st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
                 
-                # Clear selections
-                st.session_state.selected_product_id = None
+                # Clear search
+                if 'product_search_input' in st.session_state:
+                    del st.session_state['product_search_input']
                 
                 time.sleep(0.5)
                 st.rerun()
@@ -527,6 +689,8 @@ def show_detailed_entry_form():
             # Clear selections
             st.session_state.selected_brand_id = None
             st.session_state.selected_product_id = None
+            if 'product_search_input' in st.session_state:
+                del st.session_state['product_search_input']
             st.rerun()
 
 def show_items_preview():
@@ -560,20 +724,26 @@ def show_items_preview():
     else:
         show_detailed_preview(items)
 
+
 def show_compact_preview(items: List[Dict]):
-    """Compact view of items"""
+    """Compact view of physical items"""
     for idx, item in enumerate(items):
         col1, col2, col3, col4, col5 = st.columns([3, 1.5, 1.5, 1.5, 1])
         
         with col1:
-            product_display = f"**{item['product_name']}**"
-            if item.get('brand'):
-                product_display += f" - {item['brand']}"
-            st.write(product_display)
+            # Show icon based on whether item is in ERP
+            if item.get('product_id'):
+                type_icon = "📦"  # In ERP product master
+                product_display = f"{type_icon} **{item['product_name']}** (ERP)"
+                if item.get('reference_pt_code'):
+                    st.caption(f"PT: {item['reference_pt_code']}")
+            else:
+                type_icon = "❓"  # Not in ERP
+                product_display = f"{type_icon} **{item['product_name']}** (Not in ERP)"
             
-            # Show reference if exists
-            if item.get('reference_pt_code'):
-                st.caption(f"📋 Ref: {item['reference_pt_code']}")
+            st.write(product_display)
+            if item.get('brand'):
+                st.caption(f"Brand: {item['brand']}")
             
             # Location info
             location = f"{item.get('zone_name', '')}-{item.get('rack_name', '')}-{item.get('bin_name', '')}".strip('-')
@@ -605,19 +775,29 @@ def show_compact_preview(items: List[Dict]):
         if idx < len(items) - 1:
             st.markdown("---")
 
+
 def show_detailed_preview(items: List[Dict]):
     """Detailed view of items"""
     for idx, item in enumerate(items):
-        with st.expander(f"{item['product_name']} - Qty: {item['actual_quantity']:.0f}", expanded=False):
+        # Create title with type indicator
+        if item.get('item_type') == 'existing' and item.get('product_id'):
+            title = f"📦 {item['product_name']} - Qty: {item['actual_quantity']:.0f}"
+        else:
+            title = f"🆕 {item['product_name']} - Qty: {item['actual_quantity']:.0f}"
+            
+        with st.expander(title, expanded=False):
             col1, col2 = st.columns(2)
             
             with col1:
+                st.write(f"**Type:** {'Existing Product' if item.get('item_type') == 'existing' else 'New Item'}")
                 st.write(f"**Product:** {item['product_name']}")
                 st.write(f"**Brand:** {item.get('brand', 'N/A')}")
                 st.write(f"**Batch:** {item.get('batch_no', 'N/A')}")
                 st.write(f"**Package Size:** {item.get('package_size', 'N/A')}")
+                if item.get('product_id'):
+                    st.write(f"**Product ID:** {item['product_id']}")
                 if item.get('reference_pt_code'):
-                    st.write(f"**Reference PT Code:** {item['reference_pt_code']}")
+                    st.write(f"**PT Code:** {item['reference_pt_code']}")
             
             with col2:
                 st.write(f"**Quantity:** {item['actual_quantity']:.2f}")
@@ -644,6 +824,7 @@ def show_detailed_preview(items: List[Dict]):
                 remove_item(item['temp_id'])
                 st.rerun()
 
+
 def export_items_to_csv():
     """Export items to CSV"""
     if not st.session_state.new_items_list:
@@ -662,7 +843,10 @@ def export_items_to_csv():
                 pass  # Keep original value if conversion fails
         
         df_data.append({
+            'ERP Status': 'In ERP Master' if item.get('product_id') else 'Not in ERP',
+            'Product ID': item.get('product_id', ''),
             'Product Name': item.get('product_name', ''),
+            'PT Code': item.get('reference_pt_code', ''),
             'Brand': item.get('brand', ''),
             'Batch Number': item.get('batch_no', ''),
             'Quantity': item.get('actual_quantity', 0),
@@ -670,7 +854,6 @@ def export_items_to_csv():
             'Zone': item.get('zone_name', ''),
             'Rack': item.get('rack_name', ''),
             'Bin': item.get('bin_name', ''),
-            'Reference PT Code': item.get('reference_pt_code', ''),
             'Notes': item.get('notes', ''),
             'Added Time': item.get('added_time', '').strftime('%Y-%m-%d %H:%M:%S') if item.get('added_time') else ''
         })
@@ -682,7 +865,7 @@ def export_items_to_csv():
     st.download_button(
         label="📥 Download CSV",
         data=csv,
-        file_name=f"new_items_{timestamp}.csv",
+        file_name=f"warehouse_physical_items_{timestamp}.csv",
         mime="text/csv"
     )
 
@@ -740,7 +923,7 @@ def handle_clear_confirmation():
 # ============== MAIN APPLICATION ==============
 
 def main():
-    """Main application entry"""
+    """Main application entry for warehouse physical count"""
     init_session_state()
     
     # Test database connection first
@@ -762,7 +945,7 @@ def main():
 
 def show_login_page():
     """Display login page"""
-    st.title("🔐 Login - New Item Management")
+    st.title("🔐 Login - Warehouse Physical Count")
     
     col1, col2, col3 = st.columns([1, 2, 1])
     
@@ -852,12 +1035,14 @@ def show_main_app():
     if st.session_state.last_save_time:
         st.caption(f"Last save: {st.session_state.last_save_time.strftime('%H:%M:%S')}")
 
+
 def show_statistics():
     """Show statistics and analytics"""
     st.markdown("### 📊 Session Statistics")
     
     summary = get_items_summary()
     
+    # First row - main metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -871,6 +1056,17 @@ def show_statistics():
     
     with col4:
         st.metric("Total Batches", summary['total_batches'])
+    
+    # Second row - breakdown by type
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("📦 Items in ERP Master", summary['items_in_erp'], 
+                  help="Physical items that exist in ERP product master")
+    
+    with col2:
+        st.metric("❓ Items NOT in ERP", summary['items_not_in_erp'],
+                  help="Physical items not found in ERP product master")
     
     if st.session_state.new_items_list:
         # Product distribution
@@ -899,6 +1095,16 @@ def show_statistics():
         
         df_location = pd.DataFrame(location_count.items(), columns=['Zone', 'Count'])
         st.bar_chart(df_location.set_index('Zone'))
+        
+        # Type breakdown - Updated keys
+        st.markdown("#### 📊 Breakdown by ERP Status")
+        
+        type_data = {
+            'Type': ['In ERP Master', 'Not in ERP'],
+            'Count': [summary['items_in_erp'], summary['items_not_in_erp']]
+        }
+        df_type = pd.DataFrame(type_data)
+        st.bar_chart(df_type.set_index('Type'))
 
 if __name__ == "__main__":
     main()
