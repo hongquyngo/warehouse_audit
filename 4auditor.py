@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from functools import lru_cache
 from sqlalchemy import text
 import hashlib
@@ -96,9 +96,9 @@ def restore_user_session(user_id: int, session_token: str) -> bool:
             u.username,
             u.employee_id,
             u.role_id,
-            r.name as user_role,
+            COALESCE(r.name, 'viewer') as user_role,
             u.is_active,
-            CONCAT(e.first_name, ' ', e.last_name) as full_name,
+            COALESCE(CONCAT(e.first_name, ' ', e.last_name), u.username) as full_name,
             e.email
         FROM users u
         LEFT JOIN roles r ON u.role_id = r.id
@@ -124,12 +124,13 @@ def restore_user_session(user_id: int, session_token: str) -> bool:
                     logger.warning(f"User {user_id} is not active")
                     return False
                 
-                # Restore session state
+                # Restore session state with all required fields
                 st.session_state.user_id = user.user_id
+                st.session_state.id = user.user_id  # For compatibility
                 st.session_state.username = user.username
-                st.session_state.user_role = user.user_role or 'viewer'
+                st.session_state.user_role = user.user_role if user.user_role else 'viewer'
                 st.session_state.employee_id = user.employee_id
-                st.session_state.employee_name = user.full_name
+                st.session_state.employee_name = user.full_name if user.full_name and user.full_name.strip() else user.username
                 st.session_state.employee_email = user.email
                 st.session_state.login_time = datetime.now()
                 st.session_state.last_activity = datetime.now()
@@ -210,6 +211,56 @@ def update_activity():
         elapsed = (now - st.session_state.last_activity).total_seconds()
         if elapsed > SESSION_CONFIG['ACTIVITY_THRESHOLD']:
             st.session_state.last_activity = now
+
+# ============== AUTHENTICATION HELPERS ==============
+
+def safe_authenticate(username: str, password: str) -> Tuple[bool, Optional[Dict]]:
+    """Safe wrapper for authentication with proper error handling"""
+    try:
+        success, result = auth.authenticate(username, password)
+        
+        if success and isinstance(result, dict):
+            # Normalize the result dictionary
+            normalized_result = {}
+            
+            # Handle different possible key names for user ID
+            user_id = result.get('user_id') or result.get('id') or result.get('userId')
+            if user_id:
+                normalized_result['user_id'] = user_id
+                normalized_result['id'] = user_id  # Keep both for compatibility
+            else:
+                logger.error("No user ID found in auth result")
+                return False, {"error": "Invalid authentication response"}
+            
+            # Handle username
+            normalized_result['username'] = result.get('username') or username
+            
+            # Handle role
+            normalized_result['user_role'] = result.get('user_role') or result.get('role') or result.get('role_name') or 'viewer'
+            
+            # Handle employee info
+            normalized_result['employee_id'] = result.get('employee_id') or result.get('employeeId')
+            normalized_result['employee_name'] = (
+                result.get('employee_name') or 
+                result.get('full_name') or 
+                result.get('fullName') or 
+                result.get('name') or 
+                normalized_result['username']
+            )
+            normalized_result['employee_email'] = result.get('employee_email') or result.get('email')
+            
+            # Copy any other fields
+            for key, value in result.items():
+                if key not in normalized_result:
+                    normalized_result[key] = value
+            
+            return True, normalized_result
+        else:
+            return success, result
+            
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        return False, {"error": str(e)}
 
 # ============== STREAMLINED SESSION STATE ==============
 
@@ -892,10 +943,7 @@ AUDIT_ROLES = {
 
 def check_permission(action: str) -> bool:
     """Check if current user has permission for action"""
-    if 'user_role' not in st.session_state:
-        return False
-    
-    user_role = st.session_state.user_role
+    user_role = st.session_state.get('user_role', 'viewer')
     return action in AUDIT_ROLES.get(user_role, [])
 
 # ============== MAIN APPLICATION ==============
@@ -981,47 +1029,57 @@ def show_login_page():
             
             if submit:
                 if username and password:
-                    success, result = auth.authenticate(username, password)
-                    
-                    if success:
-                        # Set session timeout based on remember me
-                        if remember_me:
-                            st.session_state.session_timeout = SESSION_CONFIG['REMEMBER_ME_TIMEOUT']
-                            st.info("✅ Session will be maintained for 7 days")
+                    try:
+                        success, result = safe_authenticate(username, password)
+                        
+                        if success:
+                            # Debug: Log the result structure
+                            logger.info(f"Auth successful for user: {result.get('username')}")
+                            
+                            # Set session timeout based on remember me
+                            if remember_me:
+                                st.session_state.session_timeout = SESSION_CONFIG['REMEMBER_ME_TIMEOUT']
+                                st.info("✅ Session will be maintained for 7 days")
+                            else:
+                                st.session_state.session_timeout = SESSION_CONFIG['DEFAULT_TIMEOUT']
+                            
+                            # Initialize activity tracking
+                            st.session_state.last_activity = datetime.now()
+                            
+                            # Get user_id (already normalized in safe_authenticate)
+                            user_id = result['user_id']
+                            
+                            # Generate session token
+                            session_data = f"{user_id}_{username}_{datetime.now().timestamp()}"
+                            session_token = hashlib.sha256(session_data.encode()).hexdigest()[:32]
+                            
+                            # Store in session state
+                            st.session_state.session_token = session_token
+                            
+                            # Store in query params for persistence
+                            try:
+                                # New API (Streamlit >= 1.30.0)
+                                st.query_params["session"] = session_token
+                                st.query_params["uid"] = str(user_id)
+                            except AttributeError:
+                                # Old API
+                                st.experimental_set_query_params(
+                                    session=session_token,
+                                    uid=str(user_id)
+                                )
+                            
+                            auth.login(result)
+                            st.success("✅ Login successful!")
+                            st.rerun()
                         else:
-                            st.session_state.session_timeout = SESSION_CONFIG['DEFAULT_TIMEOUT']
-                        
-                        # Initialize activity tracking
-                        st.session_state.last_activity = datetime.now()
-                        
-                        # Generate session token
-                        session_data = f"{result['user_id']}_{username}_{datetime.now().timestamp()}"
-                        session_token = hashlib.sha256(session_data.encode()).hexdigest()[:32]
-                        
-                        # Store in session state
-                        st.session_state.session_token = session_token
-                        
-                        # Store in query params for persistence
-                        try:
-                            # New API (Streamlit >= 1.30.0)
-                            st.query_params["session"] = session_token
-                            st.query_params["uid"] = str(result['user_id'])
-                        except AttributeError:
-                            # Old API
-                            st.experimental_set_query_params(
-                                session=session_token,
-                                uid=str(result['user_id'])
-                            )
-                        
-                        # Ensure all user data is properly set for auth.get_user_display_name()
-                        if 'employee_name' not in result:
-                            result['employee_name'] = result.get('username', 'User')
-                        
-                        auth.login(result)
-                        st.success("✅ Login successful!")
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {result.get('error', 'Login failed')}")
+                            # Authentication failed
+                            error_msg = "Login failed"
+                            if isinstance(result, dict) and 'error' in result:
+                                error_msg = result['error']
+                            st.error(f"❌ {error_msg}")
+                    except Exception as e:
+                        logger.error(f"Login error: {e}", exc_info=True)
+                        st.error(f"❌ Login error: {str(e)}")
                 else:
                     st.warning("⚠️ Please enter both username and password")
         
@@ -1061,8 +1119,14 @@ def show_main_app():
         # Handle display name gracefully
         display_name = st.session_state.get('employee_name') or st.session_state.get('username', 'User')
         st.write(f"**Name:** {display_name}")
-        st.write(f"**Role:** {st.session_state.user_role}")
-        st.write(f"**Login:** {st.session_state.login_time.strftime('%H:%M')}")
+        st.write(f"**Role:** {st.session_state.get('user_role', 'N/A')}")
+        
+        # Handle login time
+        login_time = st.session_state.get('login_time')
+        if login_time:
+            st.write(f"**Login:** {login_time.strftime('%H:%M')}")
+        else:
+            st.write(f"**Login:** Just now")
         
         # Session info
         st.markdown("---")
@@ -1118,7 +1182,7 @@ def show_main_app():
             st.rerun()
     
     # Main content based on role
-    user_role = st.session_state.user_role
+    user_role = st.session_state.get('user_role', 'viewer')
     
     if not AUDIT_ROLES.get(user_role, []):
         show_no_access_interface()
