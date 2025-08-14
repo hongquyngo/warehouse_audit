@@ -139,6 +139,54 @@ def get_team_physical_count_summary(session_id: int):
         return {}
 
 @st.cache_data(ttl=300)
+def get_team_physical_count_for_product(session_id: int, product_id: int):
+    """Get team physical count summary for a specific product"""
+    try:
+        query = """
+        SELECT 
+            COUNT(DISTINCT acd.created_by_user_id) as total_users,
+            COUNT(DISTINCT acd.transaction_id) as total_transactions,
+            COUNT(*) as total_records,
+            SUM(acd.actual_quantity) as total_quantity,
+            MIN(acd.counted_date) as first_counted,
+            MAX(acd.counted_date) as last_counted,
+            GROUP_CONCAT(DISTINCT u.username) as users_list,
+            GROUP_CONCAT(DISTINCT at.transaction_code) as transaction_codes
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        JOIN users u ON acd.created_by_user_id = u.id
+        WHERE at.session_id = :session_id
+        AND acd.product_id = :product_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {
+                "session_id": session_id, 
+                "product_id": product_id
+            })
+            row = result.fetchone()
+            
+            if row and row.total_records:
+                return {
+                    'total_users': row.total_users or 0,
+                    'total_transactions': row.total_transactions or 0,
+                    'total_records': row.total_records or 0,
+                    'total_quantity': float(row.total_quantity) if row.total_quantity else 0,
+                    'first_counted': row.first_counted,
+                    'last_counted': row.last_counted,
+                    'users_list': row.users_list.split(',') if row.users_list else [],
+                    'transaction_codes': row.transaction_codes.split(',') if row.transaction_codes else []
+                }
+            return None
+    except Exception as e:
+        logger.error(f"Error getting team product count: {e}")
+        return None
+
+@st.cache_data(ttl=300)
 def get_team_physical_counts_detail(session_id: int):
     """Get detailed team physical counts grouped by transaction"""
     try:
@@ -344,6 +392,7 @@ def clear_all_items():
     get_team_physical_count_summary.clear()
     get_team_physical_counts_detail.clear()
     get_team_top_products.clear()
+    get_team_physical_count_for_product.clear()
 
 def get_items_summary() -> Dict:
     """Get summary statistics for current user's pending physical items"""
@@ -430,6 +479,7 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
         get_team_physical_count_summary.clear()
         get_team_physical_counts_detail.clear()
         get_team_top_products.clear()
+        get_team_physical_count_for_product.clear()
     
     return saved, errors
 
@@ -561,7 +611,7 @@ def show_transaction_selector():
         return None
 
 def show_entry_form():
-    """Show simplified entry form with auto clear"""
+    """Show simplified entry form with auto clear and team count check"""
     st.markdown("### ✏️ Add Physical Item")
     
     # Initialize form key if not exists
@@ -606,9 +656,46 @@ def show_entry_form():
     st.session_state.selected_product_key = selected_product_key
     selected_product = product_options.get(selected_product_key)
     
-    # Show selected product info
+    # Show selected product info and team count check
     if selected_product:
-        st.success(f"✅ ERP Product Selected: {selected_product['pt_code']} - {selected_product['product_name']} (ID: {selected_product['id']})")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.success(f"✅ ERP Product Selected: {selected_product['pt_code']} - {selected_product['product_name']} (ID: {selected_product['id']})")
+        
+        # Check if team has already counted this product
+        if 'selected_session_id' in st.session_state:
+            team_product_count = get_team_physical_count_for_product(
+                st.session_state.selected_session_id,
+                selected_product['id']
+            )
+            
+            if team_product_count:
+                with col2:
+                    st.warning(f"⚠️ Already counted by team: {team_product_count['total_quantity']:.0f} units")
+                
+                # Show detailed team count info
+                with st.expander(f"👥 View Team Counts ({team_product_count['total_users']} users, {team_product_count['total_records']} records)", expanded=False):
+                    col_info1, col_info2, col_info3 = st.columns(3)
+                    with col_info1:
+                        st.metric("Total Quantity", f"{team_product_count['total_quantity']:.0f}")
+                    with col_info2:
+                        st.metric("Total Records", team_product_count['total_records'])
+                    with col_info3:
+                        st.metric("Users", team_product_count['total_users'])
+                    
+                    st.markdown("**Counted by:**")
+                    for user in team_product_count['users_list']:
+                        st.caption(f"• {user}")
+                    
+                    st.markdown("**In transactions:**")
+                    for tx_code in team_product_count['transaction_codes']:
+                        st.caption(f"• {tx_code}")
+                    
+                    if team_product_count['last_counted']:
+                        st.caption(f"Last counted: {pd.to_datetime(team_product_count['last_counted']).strftime('%Y-%m-%d %H:%M')}")
+            else:
+                with col2:
+                    st.info("ℹ️ Not yet counted by team")
     else:
         st.info("ℹ️ Product not in ERP - Enter details manually below")
     
@@ -773,6 +860,9 @@ def show_entry_form():
                     
                     # Reset product selector to default
                     st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+                    
+                    # Clear cache to refresh team counts
+                    get_team_physical_count_for_product.clear()
                     
                     # Increment form key to force form reset
                     st.session_state.form_key += 1
