@@ -99,6 +99,48 @@ def get_session_product_summary(session_id: int, product_id: int):
     """Get total counts for a product across all transactions in session"""
     return audit_service.get_product_total_summary(session_id, product_id)
 
+@st.cache_data(ttl=300)
+def get_all_products_team_summary(session_id: int):
+    """Get team count summary for all products in session"""
+    try:
+        # Get summary for all products at once
+        engine = get_db_engine()
+        query = """
+        SELECT 
+            acd.product_id,
+            COUNT(DISTINCT acd.transaction_id) as total_transactions,
+            COUNT(DISTINCT acd.created_by_user_id) as total_users,
+            COUNT(DISTINCT acd.batch_no) as total_batches,
+            COUNT(*) as total_count_records,
+            SUM(acd.actual_quantity) as grand_total_counted
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        WHERE at.session_id = :session_id
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        GROUP BY acd.product_id
+        """
+        
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id})
+            rows = result.fetchall()
+            
+            # Convert to dictionary keyed by product_id
+            summary_dict = {}
+            for row in rows:
+                summary_dict[row.product_id] = {
+                    'total_transactions': row.total_transactions,
+                    'total_users': row.total_users,
+                    'total_batches': row.total_batches,
+                    'total_count_records': row.total_count_records,
+                    'grand_total_counted': float(row.grand_total_counted) if row.grand_total_counted else 0
+                }
+            
+            return summary_dict
+    except Exception as e:
+        logger.error(f"Error getting all products team summary: {e}")
+        return {}
+
 # ============== OPTIMIZED CALLBACKS ==============
 
 def on_product_change():
@@ -198,6 +240,9 @@ def save_counts_callback():
                 # Clear relevant caches
                 get_count_summary.clear()
                 get_session_product_summary.clear()
+                get_all_products_team_summary.clear()
+                # Force reload of products to update status
+                st.session_state.products_loaded = False
             
             st.session_state.last_action_time = datetime.now()
             
@@ -488,29 +533,44 @@ def counting_page():
                 # Get products
                 products = get_warehouse_products(warehouse_id)
                 
+                # Get team count summaries for ALL products at once (efficient)
+                team_summaries = get_all_products_team_summary(st.session_state.selected_session_id)
+                
                 # Build product options
                 product_options = ["-- Select Product --"]
                 products_map = {}
                 
                 for p in products:
-                    # Simple status check first
+                    product_id = p['product_id']
                     system_qty = p.get('total_quantity', 0)
+                    
+                    # Get team count info from pre-loaded summaries
+                    team_summary = team_summaries.get(product_id, {})
+                    team_counted_qty = team_summary.get('grand_total_counted', 0)
+                    team_count_records = team_summary.get('total_count_records', 0)
                     
                     # Check temp counts
                     temp_qty = sum(tc['actual_quantity'] for tc in st.session_state.temp_counts 
-                                   if tc.get('product_id') == p['product_id'])
+                                   if tc.get('product_id') == product_id)
                     
-                    # Basic status
+                    # Determine status based on TEAM counted quantity
                     if temp_qty > 0:
                         status = "🔓"  # Has pending counts
+                    elif team_counted_qty >= system_qty * 0.95 and system_qty > 0:
+                        status = "✅"  # Fully counted (95%+)
+                    elif team_counted_qty > 0:
+                        status = "🟡"  # Partially counted
                     else:
-                        status = "⭕"  # Default
+                        status = "⭕"  # Not counted
                     
                     # Format display
                     display = f"{status} {p.get('pt_code', 'N/A')} - {p.get('product_name', 'Unknown')[:40]}"
                     if len(p.get('product_name', '')) > 40:
                         display += "..."
-                    display += f" [System: {system_qty:.0f}]"
+                    if team_counted_qty > 0:
+                        display += f" [{team_count_records} records, {team_counted_qty:.0f}/{system_qty:.0f}]"
+                    else:
+                        display += f" [System: {system_qty:.0f}]"
                     
                     product_options.append(display)
                     products_map[display] = p
@@ -555,6 +615,7 @@ def counting_page():
             get_warehouse_products.clear()
             get_count_summary.clear()
             get_session_product_summary.clear()
+            get_all_products_team_summary.clear()
             st.session_state.products_loaded = False
             st.rerun()
     

@@ -1,4 +1,4 @@
-# main_warehouse_physical_count.py - Simplified Product Selection
+# main_warehouse_physical_count.py - Enhanced with Team Count Features
 # Records both existing products found in warehouse and new items not in ERP
 import streamlit as st
 import pandas as pd
@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Tuple
 import json
+from sqlalchemy import text
 
 # Import existing utilities
 from utils.auth import AuthManager
@@ -16,9 +17,6 @@ from utils.db import get_db_engine
 # Import services
 from audit_service import AuditService, AuditException
 from audit_queries import AuditQueries
-
-# Import SQLAlchemy text
-from sqlalchemy import text
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,8 +57,11 @@ def init_session_state():
     
     if 'product_selector' not in st.session_state:
         st.session_state.product_selector = "-- Not in ERP / New Product --"
+    
+    if 'show_team_counts' not in st.session_state:
+        st.session_state.show_team_counts = False
 
-# ============== SIMPLIFIED CACHE FUNCTIONS ==============
+# ============== CACHE FUNCTIONS ==============
 
 @st.cache_data(ttl=3600)
 def get_all_products():
@@ -91,6 +92,217 @@ def get_all_products():
         logger.error(f"Error getting products: {e}")
         st.error(f"Failed to load products: {str(e)}")
         return []
+
+@st.cache_data(ttl=300)
+def get_team_physical_count_summary(session_id: int):
+    """Get team-wide physical count summary"""
+    try:
+        query = """
+        SELECT 
+            COUNT(DISTINCT acd.created_by_user_id) as total_users,
+            COUNT(DISTINCT acd.transaction_id) as total_transactions,
+            COUNT(*) as total_items,
+            SUM(acd.actual_quantity) as total_quantity,
+            COUNT(DISTINCT acd.product_id) as products_in_erp,
+            COUNT(DISTINCT CASE WHEN acd.product_id IS NULL THEN acd.actual_notes END) as products_not_in_erp,
+            COUNT(DISTINCT CASE WHEN acd.product_id IS NOT NULL THEN acd.product_id END) as unique_erp_products,
+            MIN(acd.counted_date) as first_counted,
+            MAX(acd.counted_date) as last_counted
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        WHERE at.session_id = :session_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id})
+            row = result.fetchone()
+            
+            if row:
+                return {
+                    'total_users': row.total_users or 0,
+                    'total_transactions': row.total_transactions or 0,
+                    'total_items': row.total_items or 0,
+                    'total_quantity': float(row.total_quantity) if row.total_quantity else 0,
+                    'products_in_erp': row.products_in_erp or 0,
+                    'products_not_in_erp': row.products_not_in_erp or 0,
+                    'unique_erp_products': row.unique_erp_products or 0,
+                    'first_counted': row.first_counted,
+                    'last_counted': row.last_counted
+                }
+            return {}
+    except Exception as e:
+        logger.error(f"Error getting team summary: {e}")
+        return {}
+
+@st.cache_data(ttl=300)
+def get_team_physical_counts_detail(session_id: int):
+    """Get detailed team physical counts grouped by transaction"""
+    try:
+        query = """
+        SELECT 
+            acd.transaction_id,
+            at.transaction_code,
+            at.transaction_name,
+            at.status as transaction_status,
+            u.username as counted_by,
+            CONCAT(e.first_name, ' ', e.last_name) as counter_name,
+            acd.product_id,
+            COALESCE(p.name, SUBSTRING_INDEX(acd.actual_notes, ' - ', -1)) as product_name,
+            COALESCE(p.pt_code, 'N/A') as pt_code,
+            acd.batch_no,
+            acd.actual_quantity,
+            acd.zone_name,
+            acd.rack_name,
+            acd.bin_name,
+            acd.actual_notes,
+            acd.counted_date,
+            CASE 
+                WHEN acd.product_id IS NOT NULL THEN 'IN_ERP'
+                ELSE 'NOT_IN_ERP'
+            END as item_type
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        JOIN users u ON acd.created_by_user_id = u.id
+        LEFT JOIN employees e ON u.employee_id = e.id
+        LEFT JOIN products p ON acd.product_id = p.id
+        WHERE at.session_id = :session_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        ORDER BY at.transaction_code, acd.counted_date DESC
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id})
+            return [dict(row._mapping) for row in result.fetchall()]
+    except Exception as e:
+        logger.error(f"Error getting team detail counts: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def get_team_top_products(session_id: int, limit: int = 10):
+    """Get top products by team quantity"""
+    try:
+        query = """
+        SELECT 
+            CASE 
+                WHEN acd.product_id IS NOT NULL THEN p.name
+                ELSE SUBSTRING_INDEX(acd.actual_notes, ' - ', -1)
+            END as product_name,
+            CASE 
+                WHEN acd.product_id IS NOT NULL THEN p.pt_code
+                ELSE 'NOT_IN_ERP'
+            END as pt_code,
+            COUNT(*) as count_records,
+            SUM(acd.actual_quantity) as total_quantity,
+            COUNT(DISTINCT acd.created_by_user_id) as unique_users
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        LEFT JOIN products p ON acd.product_id = p.id
+        WHERE at.session_id = :session_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        GROUP BY acd.product_id, product_name, pt_code
+        ORDER BY total_quantity DESC
+        LIMIT :limit
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id, "limit": limit})
+            return [dict(row._mapping) for row in result.fetchall()]
+    except Exception as e:
+        logger.error(f"Error getting top products: {e}")
+        return []
+
+# ============== TEAM COUNT DISPLAY FUNCTIONS ==============
+
+def display_team_physical_counts(session_id: int, current_tx_id: int):
+    """Display all team physical counts"""
+    try:
+        # Get detailed counts
+        all_counts = get_team_physical_counts_detail(session_id)
+        
+        if all_counts:
+            # Group by transaction
+            transactions = {}
+            for count in all_counts:
+                tx_id = count['transaction_id']
+                if tx_id not in transactions:
+                    transactions[tx_id] = {
+                        'transaction_code': count['transaction_code'],
+                        'transaction_name': count['transaction_name'],
+                        'transaction_status': count['transaction_status'],
+                        'counts': []
+                    }
+                transactions[tx_id]['counts'].append(count)
+            
+            # Display each transaction
+            for tx_id, tx_data in transactions.items():
+                # Calculate transaction totals
+                tx_total_qty = sum(c['actual_quantity'] for c in tx_data['counts'])
+                tx_total_items = len(tx_data['counts'])
+                tx_users = len(set(c['counted_by'] for c in tx_data['counts']))
+                tx_in_erp = sum(1 for c in tx_data['counts'] if c['item_type'] == 'IN_ERP')
+                tx_not_in_erp = tx_total_items - tx_in_erp
+                
+                is_current = (tx_id == current_tx_id)
+                status_emoji = "✅" if tx_data['transaction_status'] == 'completed' else "🔓"
+                current_indicator = " 👈 (Current)" if is_current else ""
+                
+                st.markdown(f"### {status_emoji} {tx_data['transaction_code']} - {tx_data['transaction_name']}{current_indicator}")
+                
+                # Transaction metrics
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("👥 Users", tx_users)
+                with col2:
+                    st.metric("📊 Items", tx_total_items)
+                with col3:
+                    st.metric("📢 Total Qty", f"{tx_total_qty:.0f}")
+                with col4:
+                    st.metric("📦 In ERP", tx_in_erp)
+                with col5:
+                    st.metric("❓ Not in ERP", tx_not_in_erp)
+                
+                # Show count details in expandable section
+                with st.expander(f"View {len(tx_data['counts'])} items", expanded=is_current):
+                    for count in tx_data['counts']:
+                        col1, col2, col3, col4, col5 = st.columns([2, 2, 1, 1, 2])
+                        
+                        with col1:
+                            st.write(f"**{count['counter_name'] or count['counted_by']}**")
+                            st.caption(f"@{count['counted_by']}")
+                        
+                        with col2:
+                            if count['item_type'] == 'IN_ERP':
+                                st.write(f"📦 {count['pt_code']} - {count['product_name']}")
+                            else:
+                                st.write(f"❓ {count['product_name']}")
+                            st.caption(f"Batch: {count['batch_no'] or 'N/A'}")
+                        
+                        with col3:
+                            st.write(f"Qty: {count['actual_quantity']:.0f}")
+                        
+                        with col4:
+                            location = f"{count['zone_name']}-{count['rack_name']}-{count['bin_name']}"
+                            st.write(f"📍 {location}")
+                        
+                        with col5:
+                            st.caption(pd.to_datetime(count['counted_date']).strftime('%Y-%m-%d %H:%M'))
+                
+                st.markdown("---")
+        else:
+            st.info("No physical counts recorded by team yet")
+            
+    except Exception as e:
+        st.error(f"Error loading team counts: {str(e)}")
 
 # ============== ITEM MANAGEMENT FUNCTIONS ==============
 
@@ -128,9 +340,13 @@ def clear_all_items():
     """Clear all items from list"""
     st.session_state.new_items_list = []
     st.session_state.item_counter = 0
+    # Clear team count cache
+    get_team_physical_count_summary.clear()
+    get_team_physical_counts_detail.clear()
+    get_team_top_products.clear()
 
 def get_items_summary() -> Dict:
-    """Get summary statistics for physical items"""
+    """Get summary statistics for current user's pending physical items"""
     if not st.session_state.new_items_list:
         return {
             'total_items': 0,
@@ -210,6 +426,10 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
     if saved > 0:
         st.session_state.last_save_time = datetime.now()
         clear_all_items()
+        # Clear caches to refresh team data
+        get_team_physical_count_summary.clear()
+        get_team_physical_counts_detail.clear()
+        get_team_top_products.clear()
     
     return saved, errors
 
@@ -232,44 +452,64 @@ def show_header():
             st.rerun()
 
 def show_summary_bar():
-    """Display summary statistics bar"""
-    summary = get_items_summary()
+    """Display summary statistics bar with team data"""
+    # Get current user summary
+    user_summary = get_items_summary()
     
-    if summary['total_items'] > 0:
-        col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.5, 1.5, 2.5])
-        
-        with col1:
-            status_color = "🟡" if summary['total_items'] < 10 else "🔴"
-            st.markdown(f"### {status_color} Pending Items")
-        
-        with col2:
-            st.metric("Items", summary['total_items'], 
-                     delta=f"/{20} max" if summary['total_items'] < 20 else "MAX")
-        
-        with col3:
-            st.metric("Quantity", f"{summary['total_quantity']:.0f}")
-        
-        with col4:
-            st.metric("Products", summary['unique_products'])
-        
-        with col5:
-            col_save, col_clear, col_export = st.columns(3)
-            
+    # Get team summary if we have a session
+    team_summary = None
+    if 'selected_session_id' in st.session_state:
+        team_summary = get_team_physical_count_summary(st.session_state.selected_session_id)
+    
+    col1, col2, col3 = st.columns([4, 4, 4])
+    
+    with col1:
+        st.markdown("### 📋 Your Pending Items")
+        if user_summary['total_items'] > 0:
+            subcol1, subcol2, subcol3 = st.columns(3)
+            with subcol1:
+                st.metric("Items", user_summary['total_items'])
+            with subcol2:
+                st.metric("Quantity", f"{user_summary['total_quantity']:.0f}")
+            with subcol3:
+                st.metric("Products", user_summary['unique_products'])
+        else:
+            st.info("No pending items")
+    
+    with col2:
+        st.markdown("### 👥 Team Total (All Saved)")
+        if team_summary and team_summary.get('total_items', 0) > 0:
+            subcol1, subcol2, subcol3 = st.columns(3)
+            with subcol1:
+                st.metric("Items", team_summary['total_items'])
+            with subcol2:
+                st.metric("Quantity", f"{team_summary['total_quantity']:.0f}")
+            with subcol3:
+                st.metric("Users", team_summary['total_users'])
+        else:
+            st.info("No team counts yet")
+    
+    with col3:
+        st.markdown("### 🎯 Actions")
+        if user_summary['total_items'] > 0:
+            col_save, col_clear = st.columns(2)
             with col_save:
-                save_disabled = summary['total_items'] == 0
-                if st.button("💾 Save All", use_container_width=True, 
-                           type="primary", disabled=save_disabled):
+                if st.button("💾 Save All", use_container_width=True, type="primary"):
                     st.session_state.trigger_save = True
-            
             with col_clear:
                 if st.button("🗑️ Clear", use_container_width=True):
                     st.session_state.show_clear_confirm = True
-            
-            with col_export:
-                if st.button("📥 Export", use_container_width=True):
-                    export_items_to_csv()
         
-        st.markdown("---")
+        # Team view button
+        if team_summary and team_summary.get('total_items', 0) > 0:
+            if st.button(
+                f"👥 View All Team Counts ({team_summary['total_users']} users, {team_summary['total_items']} items)",
+                use_container_width=True,
+                key="toggle_team_view"
+            ):
+                st.session_state.show_team_counts = not st.session_state.show_team_counts
+    
+    st.markdown("---")
 
 def show_transaction_selector():
     """Show transaction selector"""
@@ -322,7 +562,7 @@ def show_transaction_selector():
 
 def show_entry_form():
     """Show simplified entry form with auto clear"""
-    st.markdown("### ✏️ Add Item")
+    st.markdown("### ✏️ Add Physical Item")
     
     # Initialize form key if not exists
     if 'form_key' not in st.session_state:
@@ -699,52 +939,80 @@ def handle_clear_confirmation():
                     st.rerun()
 
 def show_statistics():
-    """Show statistics and analytics"""
-    st.markdown("### 📊 Session Statistics")
+    """Show team statistics and analytics"""
+    st.markdown("### 📊 Team Statistics")
     
-    summary = get_items_summary()
+    if 'selected_session_id' not in st.session_state:
+        st.info("Select a session to view team statistics")
+        return
+    
+    # Get team summary
+    team_summary = get_team_physical_count_summary(st.session_state.selected_session_id)
+    
+    if not team_summary or team_summary.get('total_items', 0) == 0:
+        st.info("No team data available yet")
+        return
     
     # Main metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Items", summary['total_items'])
+        st.metric("Total Items", team_summary['total_items'])
     
     with col2:
-        st.metric("Total Quantity", f"{summary['total_quantity']:.0f}")
+        st.metric("Total Quantity", f"{team_summary['total_quantity']:.0f}")
     
     with col3:
-        st.metric("Unique Products", summary['unique_products'])
+        st.metric("Unique Users", team_summary['total_users'])
     
     with col4:
-        st.metric("Total Batches", summary['total_batches'])
+        st.metric("Transactions", team_summary['total_transactions'])
     
     # Breakdown by type
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("📦 Items in ERP Master", summary['items_in_erp'], 
+        st.metric("📦 Items in ERP Master", team_summary['products_in_erp'], 
                   help="Physical items that exist in ERP product master")
     
     with col2:
-        st.metric("❓ Items NOT in ERP", summary['items_not_in_erp'],
+        st.metric("❓ Items NOT in ERP", team_summary['products_not_in_erp'],
                   help="Physical items not found in ERP product master")
     
-    if st.session_state.new_items_list:
-        # Product distribution chart
-        st.markdown("#### 📈 Top Products by Quantity")
+    with col3:
+        st.metric("🎯 Unique ERP Products", team_summary['unique_erp_products'])
+    
+    # Time range
+    if team_summary.get('first_counted') and team_summary.get('last_counted'):
+        st.caption(f"📅 Count period: {pd.to_datetime(team_summary['first_counted']).strftime('%Y-%m-%d %H:%M')} - {pd.to_datetime(team_summary['last_counted']).strftime('%Y-%m-%d %H:%M')}")
+    
+    # Top products chart
+    st.markdown("#### 📈 Top Products by Quantity (Team)")
+    
+    top_products = get_team_top_products(st.session_state.selected_session_id)
+    
+    if top_products:
+        # Create DataFrame for visualization
+        df_top = pd.DataFrame(top_products)
+        df_top['Product'] = df_top.apply(lambda x: f"{x['pt_code']} - {x['product_name'][:30]}..." 
+                                         if len(x['product_name']) > 30 
+                                         else f"{x['pt_code']} - {x['product_name']}", axis=1)
         
-        product_qty = {}
-        for item in st.session_state.new_items_list:
-            product = item.get('product_name', 'Unknown')
-            qty = item.get('actual_quantity', 0)
-            product_qty[product] = product_qty.get(product, 0) + qty
+        # Bar chart
+        st.bar_chart(df_top.set_index('Product')['total_quantity'])
         
-        sorted_products = sorted(product_qty.items(), key=lambda x: x[1], reverse=True)[:10]
-        
-        if sorted_products:
-            df = pd.DataFrame(sorted_products, columns=['Product', 'Total Quantity'])
-            st.bar_chart(df.set_index('Product'))
+        # Details table
+        st.markdown("##### Product Details")
+        for _, product in df_top.iterrows():
+            col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+            with col1:
+                st.write(product['Product'])
+            with col2:
+                st.metric("Quantity", f"{product['total_quantity']:.0f}")
+            with col3:
+                st.metric("Records", product['count_records'])
+            with col4:
+                st.metric("Users", product['unique_users'])
 
 # ============== MAIN APPLICATION ==============
 
@@ -784,15 +1052,22 @@ def show_main_app():
     # Header
     show_header()
     
-    # Summary bar
+    # Summary bar with team data
     show_summary_bar()
     
     # Transaction selector
     transaction_id = show_transaction_selector()
     
     if transaction_id:
+        # Show team counts if toggled
+        if st.session_state.show_team_counts:
+            st.markdown("---")
+            st.markdown("## 👥 All Team Physical Counts")
+            display_team_physical_counts(st.session_state.selected_session_id, transaction_id)
+            st.markdown("---")
+        
         # Main content in tabs
-        tab1, tab2, tab3 = st.tabs(["📝 Add Items", "📋 Review & Save", "📊 Statistics"])
+        tab1, tab2, tab3 = st.tabs(["📝 Add Items", "📋 Review & Save", "📊 Team Statistics"])
         
         with tab1:
             # Entry form

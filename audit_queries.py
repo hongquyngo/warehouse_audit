@@ -378,6 +378,7 @@ class AuditQueries:
     AND at.session_id = :session_id
     AND acd.delete_flag = 0
     AND at.delete_flag = 0
+    AND acd.is_new_item = 0
     GROUP BY acd.transaction_id, acd.batch_no, u.id
     ORDER BY acd.transaction_id DESC, acd.batch_no
     """
