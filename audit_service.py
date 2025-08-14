@@ -661,7 +661,48 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error getting batch count history: {e}")
             return []
-    
+        
+    def get_product_counts_all_transactions(self, session_id: int, product_id: int) -> List[Dict]:
+        """Get all counts for a product across all transactions in the session"""
+        try:
+            query = self.queries.GET_PRODUCT_COUNTS_ALL_TRANSACTIONS
+            params = {
+                'session_id': session_id,
+                'product_id': product_id
+            }
+            return self._execute_query(query, params)
+        except Exception as e:
+            logger.error(f"Error getting all transaction counts: {e}")
+            return []
+
+    def get_product_total_summary(self, session_id: int, product_id: int) -> Dict:
+        """Get total summary for a product across all transactions"""
+        try:
+            query = self.queries.GET_PRODUCT_TOTAL_SUMMARY
+            params = {
+                'session_id': session_id,
+                'product_id': product_id
+            }
+            result = self._execute_query(query, params, fetch='one')
+            return result or {
+                'total_transactions': 0,
+                'total_users': 0,
+                'total_batches': 0,
+                'total_count_records': 0,
+                'grand_total_counted': 0
+            }
+        except Exception as e:
+            logger.error(f"Error getting product total summary: {e}")
+            return {
+                'total_transactions': 0,
+                'total_users': 0,
+                'total_batches': 0,
+                'total_count_records': 0,
+                'grand_total_counted': 0
+            }
+
+
+
     # ============== PRODUCT AND INVENTORY ==============
     
     def get_warehouses(self) -> List[Dict]:

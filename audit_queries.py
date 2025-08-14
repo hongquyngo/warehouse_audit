@@ -353,8 +353,53 @@ class AuditQueries:
     AND acd.batch_no = :batch_no
     AND acd.delete_flag = 0
     ORDER BY acd.counted_date DESC
+        """
+        
+    # Add these queries to the AuditQueries class
+
+    GET_PRODUCT_COUNTS_ALL_TRANSACTIONS = """
+    SELECT 
+        acd.transaction_id,
+        at.transaction_code,
+        at.transaction_name,
+        at.status as transaction_status,
+        u.username as counted_by,
+        CONCAT(e.first_name, ' ', e.last_name) as counter_name,
+        acd.batch_no,
+        COUNT(*) as count_records,
+        SUM(acd.actual_quantity) as total_counted,
+        MAX(acd.counted_date) as last_counted,
+        GROUP_CONCAT(DISTINCT CONCAT(acd.zone_name, '-', acd.rack_name, '-', acd.bin_name)) as locations
+    FROM audit_count_details acd
+    JOIN audit_transactions at ON acd.transaction_id = at.id
+    JOIN users u ON acd.created_by_user_id = u.id
+    LEFT JOIN employees e ON u.employee_id = e.id
+    WHERE acd.product_id = :product_id
+    AND at.session_id = :session_id
+    AND acd.delete_flag = 0
+    AND at.delete_flag = 0
+    GROUP BY acd.transaction_id, acd.batch_no, u.id
+    ORDER BY acd.transaction_id DESC, acd.batch_no
     """
-    
+
+    GET_PRODUCT_TOTAL_SUMMARY = """
+    SELECT 
+        COUNT(DISTINCT acd.transaction_id) as total_transactions,
+        COUNT(DISTINCT acd.created_by_user_id) as total_users,
+        COUNT(DISTINCT acd.batch_no) as total_batches,
+        COUNT(*) as total_count_records,
+        COALESCE(SUM(acd.actual_quantity), 0) as grand_total_counted,
+        MIN(acd.counted_date) as first_counted,
+        MAX(acd.counted_date) as last_counted
+    FROM audit_count_details acd
+    JOIN audit_transactions at ON acd.transaction_id = at.id
+    WHERE acd.product_id = :product_id
+    AND at.session_id = :session_id
+    AND acd.delete_flag = 0
+    AND at.delete_flag = 0
+    """
+
+
     # ============== PRODUCT AND INVENTORY QUERIES ==============
     
     GET_WAREHOUSES = """
