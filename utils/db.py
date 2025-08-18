@@ -1,4 +1,4 @@
-# utils/db.py - Database Connection Utilities for iSCM Dashboard
+# utils/db.py
 
 import pandas as pd
 from sqlalchemy import create_engine

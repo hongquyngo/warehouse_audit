@@ -1,4 +1,4 @@
-# utils/auth.py - Authentication module for SCM app
+# utils/auth.py
 
 import streamlit as st
 import hashlib
