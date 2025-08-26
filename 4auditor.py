@@ -564,9 +564,16 @@ def counting_page():
                         status = "⭕"  # Not counted
                     
                     # Format display
-                    display = f"{status} {p.get('pt_code', 'N/A')} - {p.get('product_name', 'Unknown')[:40]}"
-                    if len(p.get('product_name', '')) > 40:
-                        display += "..."
+                    product_name = p.get('product_name', 'Unknown')
+                    package_size = p.get('package_size', 'Unknown')
+                    brand = p.get('brand', 'Unknown')
+
+                    # Cắt chuỗi đến 40 ký tự, thêm "..." nếu dài hơn
+                    product_display = product_name[:40] + ("..." if len(product_name) > 40 else "")
+                    package_display = package_size[:40] + ("..." if len(package_size) > 40 else "")
+
+                    display = f"{status} {p.get('pt_code', 'N/A')} - {product_display} || {package_display} ({brand})"
+
                     if team_counted_qty > 0:
                         display += f" [{team_count_records} records, {team_counted_qty:.0f}/{system_qty:.0f}]"
                     else:
