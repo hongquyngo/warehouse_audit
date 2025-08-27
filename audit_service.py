@@ -1013,3 +1013,79 @@ class AuditService:
         except Exception as e:
             logger.error(f"Error getting audit summary: {e}")
             return {}
+        
+        # Trong audit_service.py
+
+    def save_media_attachment(self, attachment_data: Dict) -> int:
+        """Save media attachment record to database"""
+        try:
+            query = """
+            INSERT INTO audit_media_attachments (
+                entity_type, entity_id, file_name, file_type,
+                mime_type, file_size, s3_key, s3_bucket,
+                description, uploaded_by_user_id
+            ) VALUES (
+                :entity_type, :entity_id, :file_name, :file_type,
+                :mime_type, :file_size, :s3_key, :s3_bucket,
+                :description, :uploaded_by_user_id
+            )
+            """
+            
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                result = conn.execute(text(query), attachment_data)
+                conn.commit()
+                return result.lastrowid
+                
+        except Exception as e:
+            logger.error(f"Error saving media attachment: {e}")
+            raise e
+
+    def get_entity_attachments(self, entity_type: str, entity_id: int) -> List[Dict]:
+        """Get all attachments for an entity"""
+        try:
+            query = """
+            SELECT 
+                ama.*,
+                u.username as uploaded_by_username,
+                CONCAT(e.first_name, ' ', e.last_name) as uploaded_by_name
+            FROM audit_media_attachments ama
+            LEFT JOIN users u ON ama.uploaded_by_user_id = u.id
+            LEFT JOIN employees e ON u.employee_id = e.id
+            WHERE ama.entity_type = :entity_type
+            AND ama.entity_id = :entity_id
+            AND ama.delete_flag = 0
+            ORDER BY ama.uploaded_date DESC
+            """
+            
+            return self._execute_query(query, {
+                'entity_type': entity_type,
+                'entity_id': entity_id
+            })
+            
+        except Exception as e:
+            logger.error(f"Error getting attachments: {e}")
+            return []
+
+    def delete_attachment(self, attachment_id: int, user_id: int) -> bool:
+        """Soft delete attachment"""
+        try:
+            query = """
+            UPDATE audit_media_attachments
+            SET 
+                delete_flag = 1,
+                modified_by_user_id = :user_id,
+                modified_date = NOW()
+            WHERE id = :attachment_id
+            """
+            
+            self._execute_query(query, {
+                'attachment_id': attachment_id,
+                'user_id': user_id
+            }, fetch='none')
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting attachment: {e}")
+            return False

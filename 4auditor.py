@@ -1,4 +1,4 @@
-# 4auditor.py - Simplified Warehouse Audit System
+# 4auditor.py - Enhanced Warehouse Audit System with Media Attachments
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -6,11 +6,14 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from functools import lru_cache
 from sqlalchemy import text
+import mimetypes
+import os
 
 # Import existing utilities
 from utils.auth import AuthManager
 from utils.config import config
 from utils.db import get_db_engine
+from utils.s3_utils import S3Manager
 
 # Import our services
 from audit_service import AuditService, AuditException, SessionNotFoundException, InvalidTransactionStateException, CountValidationException
@@ -32,6 +35,12 @@ st.set_page_config(
 auth = AuthManager()
 audit_service = AuditService()
 queries = AuditQueries()
+s3_manager = S3Manager()
+
+# ============== CONSTANTS ==============
+ALLOWED_IMAGE_TYPES = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
+ALLOWED_DOC_TYPES = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt']
+MAX_FILE_SIZE_MB = 20
 
 # ============== SIMPLIFIED SESSION STATE ==============
 
@@ -56,11 +65,16 @@ def init_session_state():
         
         # Display control
         'show_teamwork_view': False,
+        'show_attachments': {},
         
         # Loading states
         'products_loaded': False,
         'current_warehouse_id': None,
         'product_options': ["-- Select Product --"],
+        
+        # Media attachments
+        'pending_attachments': [],  # Temporary storage for files before saving
+        'count_attachments': {},  # Map count index to attachments
     }
     
     for key, default in defaults.items():
@@ -141,6 +155,127 @@ def get_all_products_team_summary(session_id: int):
         logger.error(f"Error getting all products team summary: {e}")
         return {}
 
+# ============== MEDIA HANDLING FUNCTIONS ==============
+
+def validate_file(uploaded_file) -> Tuple[bool, str]:
+    """Validate uploaded file"""
+    if uploaded_file is None:
+        return False, "No file selected"
+    
+    # Check file size
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        return False, f"File size exceeds {MAX_FILE_SIZE_MB}MB limit"
+    
+    # Check file type
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    allowed_extensions = ALLOWED_IMAGE_TYPES + ALLOWED_DOC_TYPES
+    
+    if file_extension not in allowed_extensions:
+        return False, f"File type .{file_extension} not allowed"
+    
+    return True, "Valid"
+
+def get_file_category(filename: str) -> str:
+    """Determine file category based on extension"""
+    extension = filename.split('.')[-1].lower()
+    if extension in ALLOWED_IMAGE_TYPES:
+        return 'images'
+    else:
+        return 'docs'
+
+def get_file_type(filename: str) -> str:
+    """Determine file type for database"""
+    extension = filename.split('.')[-1].lower()
+    if extension in ALLOWED_IMAGE_TYPES:
+        return 'image'
+    elif extension in ALLOWED_DOC_TYPES:
+        return 'document'
+    else:
+        return 'other'
+
+def display_attachment_preview(attachment: Dict):
+    """Display attachment preview based on type"""
+    file_type = attachment.get('file_type', 'other')
+    
+    col1, col2, col3 = st.columns([1, 3, 1])
+    
+    with col1:
+        if file_type == 'image':
+            st.write("🖼️ Image")
+        else:
+            st.write("📄 Document")
+    
+    with col2:
+        st.write(f"**{attachment.get('file_name', 'Unknown')}**")
+        st.caption(f"Size: {attachment.get('file_size_mb', 0):.2f}MB")
+        if attachment.get('description'):
+            st.caption(f"Note: {attachment['description']}")
+    
+    with col3:
+        if file_type == 'image' and attachment.get('s3_url'):
+            if st.button("👁️ View", key=f"view_{attachment['id']}"):
+                st.image(attachment['s3_url'], caption=attachment['file_name'])
+        elif attachment.get('s3_url'):
+            st.markdown(f"[📥 Download]({attachment['s3_url']})")
+
+def upload_count_attachments(count_id: int, attachments: List[Dict], transaction_code: str) -> List[Dict]:
+    """Upload attachments for a count detail"""
+    uploaded = []
+    
+    for attachment in attachments:
+        try:
+            file = attachment['file']
+            description = attachment.get('description', '')
+            
+            # Get file details
+            file_content = file.read()
+            file_name = file.name
+            file_size = len(file_content)
+            mime_type = mimetypes.guess_type(file_name)[0] or 'application/octet-stream'
+            file_category = get_file_category(file_name)
+            file_type = get_file_type(file_name)
+            
+            # Upload to S3
+            success, s3_key = s3_manager.upload_audit_attachment(
+                file_content=file_content,
+                filename=file_name,
+                entity_type='count_detail',
+                entity_code=transaction_code,
+                entity_id=count_id,
+                file_category=file_category,
+                content_type=mime_type
+            )
+            
+            if success:
+                # Save to database
+                attachment_data = {
+                    'entity_type': 'count_detail',
+                    'entity_id': count_id,
+                    'file_name': file_name,
+                    'file_type': file_type,
+                    'mime_type': mime_type,
+                    'file_size': file_size,
+                    's3_key': s3_key,
+                    's3_bucket': s3_manager.bucket_name,
+                    'description': description,
+                    'uploaded_by_user_id': st.session_state.user_id
+                }
+                
+                attachment_id = audit_service.save_media_attachment(attachment_data)
+                attachment_data['id'] = attachment_id
+                uploaded.append(attachment_data)
+                
+                logger.info(f"Uploaded attachment {file_name} for count {count_id}")
+            else:
+                st.error(f"Failed to upload {file_name}: {s3_key}")
+                
+        except Exception as e:
+            logger.error(f"Error uploading attachment: {e}")
+            st.error(f"Error uploading {attachment['file'].name}: {str(e)}")
+    
+    return uploaded
+
 # ============== OPTIMIZED CALLBACKS ==============
 
 def on_product_change():
@@ -179,7 +314,7 @@ def on_batch_change():
         st.session_state.form_expiry = None
 
 def add_count_callback():
-    """Add count to temporary list"""
+    """Add count to temporary list with attachments"""
     qty = st.session_state.get('qty_input', 0)
     batch_no = st.session_state.get('batch_input', '')
     location = st.session_state.get('loc_input', '')
@@ -217,8 +352,15 @@ def add_count_callback():
             'time': datetime.now().strftime('%H:%M:%S')
         }
         
+        count_index = len(st.session_state.temp_counts)
         st.session_state.temp_counts.append(count)
-        st.session_state.last_action = f"✅ Added count #{len(st.session_state.temp_counts)}"
+        
+        # Store pending attachments for this count
+        if st.session_state.pending_attachments:
+            st.session_state.count_attachments[count_index] = st.session_state.pending_attachments.copy()
+            st.session_state.pending_attachments = []
+        
+        st.session_state.last_action = f"✅ Added count #{count_index + 1}"
         st.session_state.last_action_time = datetime.now()
         
         # Clear form inputs
@@ -226,17 +368,41 @@ def add_count_callback():
         st.session_state.notes_input = ''
 
 def save_counts_callback():
-    """Save all counts to database"""
+    """Save all counts to database with attachments"""
     if st.session_state.temp_counts:
         try:
-            st.session_state.last_action = "💾 Saving..."
-            saved, errors = audit_service.save_batch_counts(st.session_state.temp_counts)
+            st.session_state.last_action = "💾 Saving counts and uploading media..."
+            
+            # Get transaction code for S3 organization
+            tx_info = audit_service.get_transaction_info(st.session_state.tx_id)
+            transaction_code = tx_info.get('transaction_code', f'TXN_{st.session_state.tx_id}')
+            
+            # Save counts first
+            saved_counts = []
+            errors = []
+            
+            for idx, count in enumerate(st.session_state.temp_counts):
+                try:
+                    # Save count
+                    count_id = audit_service.save_count_detail(count)
+                    if count_id:
+                        saved_counts.append({'index': idx, 'count_id': count_id})
+                        
+                        # Upload attachments if any
+                        if idx in st.session_state.count_attachments:
+                            attachments = st.session_state.count_attachments[idx]
+                            upload_count_attachments(count_id, attachments, transaction_code)
+                            
+                except Exception as e:
+                    errors.append(f"Count {idx + 1}: {str(e)}")
+                    logger.error(f"Save error for count {idx}: {e}")
             
             if errors:
-                st.session_state.last_action = f"⚠️ Saved {saved} counts with {len(errors)} errors"
+                st.session_state.last_action = f"⚠️ Saved {len(saved_counts)} counts with {len(errors)} errors"
             else:
-                st.session_state.last_action = f"✅ Successfully saved {saved} counts!"
+                st.session_state.last_action = f"✅ Successfully saved {len(saved_counts)} counts!"
                 st.session_state.temp_counts = []
+                st.session_state.count_attachments = {}
                 # Clear relevant caches
                 get_count_summary.clear()
                 get_session_product_summary.clear()
@@ -254,7 +420,7 @@ def save_counts_callback():
 # ============== DISPLAY FUNCTIONS ==============
 
 def display_teamwork_counts(session_id: int, product_id: int, current_tx_id: int):
-    """Display all counts for a product across all transactions"""
+    """Display all counts for a product across all transactions with attachments"""
     try:
         # Get all counts
         all_counts = audit_service.get_product_counts_all_transactions(session_id, product_id)
@@ -280,7 +446,7 @@ def display_teamwork_counts(session_id: int, product_id: int, current_tx_id: int
                 tx_users = len(set(c['counted_by'] for c in tx_data['counts']))
                 
                 is_current = (tx_id == current_tx_id)
-                status_emoji = "✅" if tx_data['transaction_status'] == 'completed' else "🔓"
+                status_emoji = "✅" if tx_data['transaction_status'] == 'completed' else "📝"
                 current_indicator = " 👈 (Current)" if is_current else ""
                 
                 st.markdown(f"### {status_emoji} {tx_data['transaction_code']} - {tx_data['transaction_name']}{current_indicator}")
@@ -323,7 +489,7 @@ def display_teamwork_counts(session_id: int, product_id: int, current_tx_id: int
         st.error(f"Error loading teamwork view: {str(e)}")
 
 def render_temp_counts():
-    """Display temporary counts"""
+    """Display temporary counts with attachments"""
     if st.session_state.temp_counts:
         st.markdown(f"### 📋 Pending Counts ({len(st.session_state.temp_counts)})")
         
@@ -346,39 +512,38 @@ def render_temp_counts():
             for i, count in enumerate(group['counts']):
                 idx = st.session_state.temp_counts.index(count)
                 
-                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 0.5])
-                
-                with col1:
-                    location = f"{count['zone_name']}"
-                    if count['rack_name']:
-                        location += f"-{count['rack_name']}"
-                    if count['bin_name']:
-                        location += f"-{count['bin_name']}"
-                    st.text(f"📍 {location}")
-                    st.caption(f"Batch: {count.get('batch_no', 'N/A')}")
-                
-                with col2:
-                    st.text(f"Qty: {count['actual_quantity']:.0f}")
-                
-                with col3:
-                    st.caption(f"Time: {count['time']}")
-                
-                with col4:
-                    if count.get('actual_notes'):
-                        st.caption(count['actual_notes'][:30])
-                
-                with col5:
-                    if st.button("❌", key=f"del_{idx}"):
-                        st.session_state.temp_counts.pop(idx)
-                        st.session_state.last_action = "🗑️ Removed count"
-                        st.session_state.last_action_time = datetime.now()
-                        st.rerun()
+                with st.expander(f"Count #{idx + 1}: {count['actual_quantity']:.0f} @ {count['zone_name']}{'-' + count['rack_name'] if count['rack_name'] else ''}{'-' + count['bin_name'] if count['bin_name'] else ''}"):
+                    col1, col2, col3 = st.columns([2, 2, 1])
+                    
+                    with col1:
+                        st.write(f"**Batch:** {count.get('batch_no', 'N/A')}")
+                        st.write(f"**Time:** {count['time']}")
+                    
+                    with col2:
+                        if count.get('actual_notes'):
+                            st.write(f"**Notes:** {count['actual_notes']}")
+                        
+                        # Show attachments if any
+                        if idx in st.session_state.count_attachments:
+                            attachments = st.session_state.count_attachments[idx]
+                            st.write(f"**📎 Attachments:** {len(attachments)}")
+                            for att in attachments:
+                                st.caption(f"• {att['file'].name} ({att['file'].size / 1024:.1f}KB)")
+                    
+                    with col3:
+                        if st.button("❌ Remove", key=f"del_{idx}"):
+                            st.session_state.temp_counts.pop(idx)
+                            if idx in st.session_state.count_attachments:
+                                del st.session_state.count_attachments[idx]
+                            st.session_state.last_action = "🗑️ Removed count"
+                            st.session_state.last_action_time = datetime.now()
+                            st.rerun()
 
 # ============== MAIN COUNTING INTERFACE ==============
 
 @st.fragment(run_every=None)
 def counting_form_fragment():
-    """Isolated counting form to prevent full page reruns"""
+    """Isolated counting form with media upload"""
     
     if not st.session_state.selected_product:
         st.info("👆 Please select a product above")
@@ -394,76 +559,132 @@ def counting_form_fragment():
     
     st.markdown("---")
     
-    # Form inputs
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        batch_no = st.text_input(
-            "Batch Number",
-            key="batch_input",
-            value=st.session_state.form_batch_no,
-            placeholder="Enter batch or select from dropdown"
-        )
+    # Form inputs with media upload
+    with st.form("counting_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
         
-        expiry = st.date_input(
-            "Expiry Date",
-            key="expiry_input",
-            value=st.session_state.form_expiry,
-            min_value=date(2020, 1, 1),
-            max_value=date(2030, 12, 31)
-        )
+        with col1:
+            batch_no = st.text_input(
+                "Batch Number",
+                key="batch_input_form",
+                value=st.session_state.form_batch_no,
+                placeholder="Enter batch or select from dropdown"
+            )
+            
+            expiry = st.date_input(
+                "Expiry Date",
+                key="expiry_input_form",
+                value=st.session_state.form_expiry,
+                min_value=date(2020, 1, 1),
+                max_value=date(2030, 12, 31)
+            )
+            
+            qty = st.number_input(
+                "Actual Quantity*",
+                min_value=0.0,
+                step=1.0,
+                key="qty_input_form",
+                format="%.2f"
+            )
         
-        qty = st.number_input(
-            "Actual Quantity*",
-            min_value=0.0,
-            step=1.0,
-            key="qty_input",
-            format="%.2f"
-        )
-    
-    with col2:
-        location = st.text_input(
-            "Location",
-            key="loc_input",
-            value=st.session_state.form_location,
-            placeholder="e.g., A1-R01-B01"
-        )
+        with col2:
+            location = st.text_input(
+                "Location",
+                key="loc_input_form",
+                value=st.session_state.form_location,
+                placeholder="e.g., A1-R01-B01"
+            )
+            
+            notes = st.text_area(
+                "Notes",
+                key="notes_input_form",
+                height=100,
+                placeholder="Any observations"
+            )
         
-        notes = st.text_area(
-            "Notes",
-            key="notes_input",
-            height=100,
-            placeholder="Any observations"
-        )
+        # Media upload section
+        st.markdown("### 📎 Attachments (Optional)")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            uploaded_files = st.file_uploader(
+                "Upload Images/Documents",
+                type=ALLOWED_IMAGE_TYPES + ALLOWED_DOC_TYPES,
+                accept_multiple_files=True,
+                key="file_uploader",
+                help=f"Max {MAX_FILE_SIZE_MB}MB per file"
+            )
+        
+        with col2:
+            attachment_notes = st.text_area(
+                "Attachment Notes",
+                key="attachment_notes",
+                placeholder="Describe the attachments (optional)",
+                height=100
+            )
+        
+        # Form submission
+        submit_col1, submit_col2 = st.columns(2)
+        
+        with submit_col1:
+            add_submitted = st.form_submit_button(
+                f"➕ Add Count ({len(st.session_state.temp_counts)}/20)",
+                type="primary",
+                use_container_width=True,
+                disabled=len(st.session_state.temp_counts) >= 20
+            )
+        
+        with submit_col2:
+            save_submitted = st.form_submit_button(
+                f"💾 Save All ({len(st.session_state.temp_counts)})",
+                use_container_width=True,
+                disabled=len(st.session_state.temp_counts) == 0
+            )
+        
+        # Handle form submission
+        if add_submitted:
+            if qty > 0 and st.session_state.selected_product:
+                # Update session state values
+                st.session_state.qty_input = qty
+                st.session_state.batch_input = batch_no
+                st.session_state.loc_input = location
+                st.session_state.notes_input = notes
+                st.session_state.expiry_input = expiry
+                
+                # Process uploaded files
+                if uploaded_files:
+                    st.session_state.pending_attachments = []
+                    for file in uploaded_files:
+                        valid, msg = validate_file(file)
+                        if valid:
+                            st.session_state.pending_attachments.append({
+                                'file': file,
+                                'description': attachment_notes
+                            })
+                        else:
+                            st.warning(f"⚠️ {file.name}: {msg}")
+                
+                # Add count
+                add_count_callback()
+                st.rerun()
+            else:
+                st.warning("⚠️ Please enter a quantity greater than 0")
+        
+        elif save_submitted:
+            save_counts_callback()
+            st.rerun()
     
-    # Action buttons
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        add_btn = st.button(
-            f"➕ Add Count ({len(st.session_state.temp_counts)}/20)",
-            on_click=add_count_callback,
-            use_container_width=True,
-            type="primary",
-            disabled=len(st.session_state.temp_counts) >= 20
-        )
-    
-    with col2:
-        save_btn = st.button(
-            f"💾 Save All ({len(st.session_state.temp_counts)})",
-            on_click=save_counts_callback,
-            use_container_width=True,
-            disabled=len(st.session_state.temp_counts) == 0
-        )
-    
-    with col3:
-        if st.button("🗑️ Clear All", use_container_width=True):
-            st.session_state.temp_counts = []
-            st.session_state.last_action = "🗑️ Cleared all pending counts"
-            st.session_state.last_action_time = datetime.now()
+    # Clear all button outside form
+    if st.button("🗑️ Clear All", use_container_width=True):
+        st.session_state.temp_counts = []
+        st.session_state.count_attachments = {}
+        st.session_state.pending_attachments = []
+        st.session_state.last_action = "🗑️ Cleared all pending counts"
+        st.session_state.last_action_time = datetime.now()
+        st.rerun()
 
 def counting_page():
-    """Main counting page"""
+    """Main counting page with media support"""
     st.subheader("🚀 Fast Counting Mode")
     
     init_session_state()
@@ -555,7 +776,7 @@ def counting_page():
                     
                     # Determine status based on TEAM counted quantity
                     if temp_qty > 0:
-                        status = "🔓"  # Has pending counts
+                        status = "📝"  # Has pending counts
                     elif team_counted_qty >= system_qty * 0.95 and system_qty > 0:
                         status = "✅"  # Fully counted (95%+)
                     elif team_counted_qty > 0:
@@ -568,7 +789,7 @@ def counting_page():
                     package_size = p.get('package_size', 'Unknown')
                     brand = p.get('brand', 'Unknown')
 
-                    # Cắt chuỗi đến 40 ký tự, thêm "..." nếu dài hơn
+                    # Cut strings to 40 chars
                     product_display = product_name[:40] + ("..." if len(product_name) > 40 else "")
                     package_display = package_size[:40] + ("..." if len(package_size) > 40 else "")
 
@@ -613,7 +834,7 @@ def counting_page():
             index=st.session_state.get('product_options', ["-- Select Product --"]).index(current_selection) if current_selection else 0,
             key="product_select",
             on_change=on_product_change,
-            help="⭕ Not counted | 🔓 Has pending counts"
+            help="⭕ Not counted | 📝 Has pending counts"
         )
     
     with col2:
@@ -665,7 +886,6 @@ def counting_page():
                         st.markdown("---")
         except Exception as e:
             logger.error(f"Error loading team counts: {e}")
-            # Don't show error to user, just log it
     
     # Batch selector
     if st.session_state.selected_product:
@@ -716,7 +936,7 @@ def counting_page():
         
         st.markdown("### ✏️ Count Entry")
     
-    # Counting form
+    # Counting form with media
     counting_form_fragment()
 
 # ============== ROLE PERMISSIONS ==============
@@ -742,7 +962,6 @@ AUDIT_ROLES = {
     'customer': [],  # No audit access
     'vendor': []     # No audit access
 }
-
 
 def check_permission(action: str) -> bool:
     """Check if current user has permission for action"""
@@ -835,13 +1054,16 @@ def show_audit_interface():
     """Main audit interface"""
     st.title("📦 Warehouse Audit System")
     
-    tab1, tab2 = st.tabs(["📄 Transactions", "🚀 Fast Counting"])
+    tab1, tab2, tab3 = st.tabs(["📄 Transactions", "🚀 Fast Counting", "📸 Media Gallery"])
     
     with tab1:
         show_transactions_page()
     
     with tab2:
         counting_page()
+    
+    with tab3:
+        show_media_gallery()
 
 def show_viewer_interface():
     """Read-only viewer interface"""
@@ -971,6 +1193,114 @@ def show_transactions_page():
     except Exception as e:
         st.error(f"Error loading transactions: {str(e)}")
         logger.error(f"Transactions page error: {e}")
+
+def show_media_gallery():
+    """Display media gallery for current session"""
+    st.subheader("📸 Media Gallery")
+    
+    if 'selected_session_id' not in st.session_state:
+        st.warning("⚠️ Please select a session in Transactions tab first")
+        return
+    
+    # Get session info
+    session_info = audit_service.get_session_info(st.session_state.selected_session_id)
+    if not session_info:
+        st.error("Session not found")
+        return
+    
+    st.info(f"**Session:** {session_info['session_name']} ({session_info['session_code']})")
+    
+    # Filter options
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Get user's transactions
+        user_transactions = audit_service.get_user_transactions(
+            st.session_state.selected_session_id,
+            st.session_state.user_id
+        )
+        
+        tx_filter = st.selectbox(
+            "Filter by Transaction",
+            ["All"] + [f"{tx['transaction_name']} ({tx['transaction_code']})" for tx in user_transactions]
+        )
+    
+    with col2:
+        media_type_filter = st.selectbox(
+            "Filter by Type",
+            ["All", "Images", "Documents"]
+        )
+    
+    with col3:
+        if st.button("🔄 Refresh Gallery", use_container_width=True):
+            st.rerun()
+    
+    # Get attachments based on filters
+    try:
+        # For now, show attachments from all user's transactions
+        all_attachments = []
+        
+        for tx in user_transactions:
+            if tx_filter != "All" and tx['transaction_code'] not in tx_filter:
+                continue
+            
+            # Get counts for this transaction
+            counts = audit_service.get_recent_counts(tx['id'], limit=100)
+            
+            for count in counts:
+                # Get attachments for each count
+                attachments = audit_service.get_entity_attachments('count_detail', count['id'])
+                
+                for att in attachments:
+                    # Apply type filter
+                    if media_type_filter == "Images" and att.get('file_type') != 'image':
+                        continue
+                    elif media_type_filter == "Documents" and att.get('file_type') != 'document':
+                        continue
+                    
+                    # Add metadata
+                    att['transaction_name'] = tx['transaction_name']
+                    att['product_name'] = count.get('product_name', 'Unknown')
+                    att['batch_no'] = count.get('batch_no', 'N/A')
+                    att['counted_date'] = count.get('counted_date')
+                    
+                    # Generate presigned URL
+                    att['s3_url'] = s3_manager.get_presigned_url(att['s3_key'], expiration=3600)
+                    
+                    all_attachments.append(att)
+        
+        if all_attachments:
+            st.markdown(f"### Found {len(all_attachments)} attachments")
+            
+            # Display in grid
+            cols = st.columns(3)
+            for idx, att in enumerate(all_attachments):
+                with cols[idx % 3]:
+                    with st.container():
+                        st.markdown(f"**{att['product_name']}**")
+                        st.caption(f"Batch: {att['batch_no']} | {att['transaction_name']}")
+                        
+                        if att['file_type'] == 'image' and att['s3_url']:
+                            st.image(att['s3_url'], use_column_width=True)
+                        else:
+                            st.write(f"📄 {att['file_name']}")
+                        
+                        st.caption(f"Uploaded by: {att.get('uploaded_by_name', att.get('uploaded_by_username', 'Unknown'))}")
+                        st.caption(f"Date: {pd.to_datetime(att['uploaded_date']).strftime('%m/%d %H:%M')}")
+                        
+                        if att.get('description'):
+                            st.caption(f"Note: {att['description']}")
+                        
+                        if att['s3_url']:
+                            st.markdown(f"[📥 Download]({att['s3_url']})")
+                        
+                        st.markdown("---")
+        else:
+            st.info("No media attachments found for the selected filters")
+            
+    except Exception as e:
+        st.error(f"Error loading media gallery: {str(e)}")
+        logger.error(f"Media gallery error: {e}")
 
 if __name__ == "__main__":
     main()

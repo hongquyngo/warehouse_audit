@@ -1,4 +1,4 @@
-# main_warehouse_physical_count.py - Enhanced with Team Count Features
+# for_auditor.py - Enhanced Physical Count with Media Attachments
 # Records both existing products found in warehouse and new items not in ERP
 import streamlit as st
 import pandas as pd
@@ -8,11 +8,14 @@ import time
 from typing import Dict, List, Optional, Tuple
 import json
 from sqlalchemy import text
+import mimetypes
+import os
 
 # Import existing utilities
 from utils.auth import AuthManager
 from utils.config import config
 from utils.db import get_db_engine
+from utils.s3_utils import S3Manager
 
 # Import services
 from audit_service import AuditService, AuditException
@@ -33,6 +36,12 @@ st.set_page_config(
 # Initialize services
 auth = AuthManager()
 audit_service = AuditService()
+s3_manager = S3Manager()
+
+# ============== CONSTANTS ==============
+ALLOWED_IMAGE_TYPES = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
+ALLOWED_DOC_TYPES = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt']
+MAX_FILE_SIZE_MB = 10
 
 # ============== SESSION STATE INITIALIZATION ==============
 def init_session_state():
@@ -60,6 +69,135 @@ def init_session_state():
     
     if 'show_team_counts' not in st.session_state:
         st.session_state.show_team_counts = False
+    
+    # Media attachment states
+    if 'pending_attachments' not in st.session_state:
+        st.session_state.pending_attachments = []
+    
+    if 'item_attachments' not in st.session_state:
+        st.session_state.item_attachments = {}
+    
+    if 'show_media_gallery' not in st.session_state:
+        st.session_state.show_media_gallery = False
+
+# ============== MEDIA HANDLING FUNCTIONS ==============
+
+def validate_file(uploaded_file) -> Tuple[bool, str]:
+    """Validate uploaded file"""
+    if uploaded_file is None:
+        return False, "No file selected"
+    
+    # Check file size
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        return False, f"File size exceeds {MAX_FILE_SIZE_MB}MB limit"
+    
+    # Check file type
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    allowed_extensions = ALLOWED_IMAGE_TYPES + ALLOWED_DOC_TYPES
+    
+    if file_extension not in allowed_extensions:
+        return False, f"File type .{file_extension} not allowed"
+    
+    return True, "Valid"
+
+def get_file_category(filename: str) -> str:
+    """Determine file category based on extension"""
+    extension = filename.split('.')[-1].lower()
+    if extension in ALLOWED_IMAGE_TYPES:
+        return 'images'
+    else:
+        return 'docs'
+
+def get_file_type(filename: str) -> str:
+    """Determine file type for database"""
+    extension = filename.split('.')[-1].lower()
+    if extension in ALLOWED_IMAGE_TYPES:
+        return 'image'
+    elif extension in ALLOWED_DOC_TYPES:
+        return 'document'
+    else:
+        return 'other'
+
+def upload_count_attachments(count_id: int, attachments: List[Dict], transaction_code: str) -> List[Dict]:
+    """Upload attachments for a physical count detail"""
+    uploaded = []
+    
+    for attachment in attachments:
+        try:
+            file = attachment['file']
+            description = attachment.get('description', '')
+            
+            # Get file details
+            file_content = file.read()
+            file_name = file.name
+            file_size = len(file_content)
+            mime_type = mimetypes.guess_type(file_name)[0] or 'application/octet-stream'
+            file_category = get_file_category(file_name)
+            file_type = get_file_type(file_name)
+            
+            # Upload to S3
+            success, s3_key = s3_manager.upload_audit_attachment(
+                file_content=file_content,
+                filename=file_name,
+                entity_type='count_detail',
+                entity_code=transaction_code,
+                entity_id=count_id,
+                file_category=file_category,
+                content_type=mime_type
+            )
+            
+            if success:
+                # Save to database
+                attachment_data = {
+                    'entity_type': 'count_detail',
+                    'entity_id': count_id,
+                    'file_name': file_name,
+                    'file_type': file_type,
+                    'mime_type': mime_type,
+                    'file_size': file_size,
+                    's3_key': s3_key,
+                    's3_bucket': s3_manager.bucket_name,
+                    'description': description,
+                    'uploaded_by_user_id': st.session_state.user_id
+                }
+                
+                attachment_id = audit_service.save_media_attachment(attachment_data)
+                attachment_data['id'] = attachment_id
+                uploaded.append(attachment_data)
+                
+                logger.info(f"Uploaded attachment {file_name} for physical count {count_id}")
+            else:
+                st.error(f"Failed to upload {file_name}: {s3_key}")
+                
+        except Exception as e:
+            logger.error(f"Error uploading attachment: {e}")
+            st.error(f"Error uploading {attachment['file'].name}: {str(e)}")
+    
+    return uploaded
+
+def display_attachment_preview(attachments: List[Dict]):
+    """Display preview of pending attachments"""
+    if not attachments:
+        return
+    
+    st.markdown(f"**📎 {len(attachments)} attachments**")
+    
+    for att in attachments:
+        file = att['file']
+        file_type = get_file_type(file.name)
+        
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if file_type == 'image':
+                st.write("🖼️")
+            else:
+                st.write("📄")
+        
+        with col2:
+            st.caption(f"{file.name} ({file.size / 1024:.1f}KB)")
+            if att.get('description'):
+                st.caption(f"Note: {att['description']}")
 
 # ============== CACHE FUNCTIONS ==============
 
@@ -208,6 +346,7 @@ def get_team_physical_counts_detail(session_id: int):
             acd.bin_name,
             acd.actual_notes,
             acd.counted_date,
+            acd.id as count_detail_id,
             CASE 
                 WHEN acd.product_id IS NOT NULL THEN 'IN_ERP'
                 ELSE 'NOT_IN_ERP'
@@ -272,7 +411,7 @@ def get_team_top_products(session_id: int, limit: int = 10):
 # ============== TEAM COUNT DISPLAY FUNCTIONS ==============
 
 def display_team_physical_counts(session_id: int, current_tx_id: int):
-    """Display all team physical counts"""
+    """Display all team physical counts with attachment indicators"""
     try:
         # Get detailed counts
         all_counts = get_team_physical_counts_detail(session_id)
@@ -301,7 +440,7 @@ def display_team_physical_counts(session_id: int, current_tx_id: int):
                 tx_not_in_erp = tx_total_items - tx_in_erp
                 
                 is_current = (tx_id == current_tx_id)
-                status_emoji = "✅" if tx_data['transaction_status'] == 'completed' else "🔓"
+                status_emoji = "✅" if tx_data['transaction_status'] == 'completed' else "📝"
                 current_indicator = " 👈 (Current)" if is_current else ""
                 
                 st.markdown(f"### {status_emoji} {tx_data['transaction_code']} - {tx_data['transaction_name']}{current_indicator}")
@@ -322,7 +461,11 @@ def display_team_physical_counts(session_id: int, current_tx_id: int):
                 # Show count details in expandable section
                 with st.expander(f"View {len(tx_data['counts'])} items", expanded=is_current):
                     for count in tx_data['counts']:
-                        col1, col2, col3, col4, col5 = st.columns([2, 2, 1, 1, 2])
+                        # Check for attachments
+                        attachments = audit_service.get_entity_attachments('count_detail', count['count_detail_id'])
+                        has_attachments = len(attachments) > 0
+                        
+                        col1, col2, col3, col4, col5, col6 = st.columns([2, 2, 1, 1, 2, 1])
                         
                         with col1:
                             st.write(f"**{count['counter_name'] or count['counted_by']}**")
@@ -344,6 +487,10 @@ def display_team_physical_counts(session_id: int, current_tx_id: int):
                         
                         with col5:
                             st.caption(pd.to_datetime(count['counted_date']).strftime('%Y-%m-%d %H:%M'))
+                        
+                        with col6:
+                            if has_attachments:
+                                st.write(f"📎 {len(attachments)}")
                 
                 st.markdown("---")
         else:
@@ -375,6 +522,11 @@ def add_new_item(item_data: Dict):
     st.session_state.new_items_list.append(item_data)
     st.session_state.item_counter += 1
     
+    # Store attachments if any
+    if st.session_state.pending_attachments:
+        st.session_state.item_attachments[item_data['temp_id']] = st.session_state.pending_attachments.copy()
+        st.session_state.pending_attachments = []
+    
     return item_data['temp_id']
 
 def remove_item(temp_id: str):
@@ -383,11 +535,16 @@ def remove_item(temp_id: str):
         item for item in st.session_state.new_items_list 
         if item.get('temp_id') != temp_id
     ]
+    # Remove attachments
+    if temp_id in st.session_state.item_attachments:
+        del st.session_state.item_attachments[temp_id]
 
 def clear_all_items():
     """Clear all items from list"""
     st.session_state.new_items_list = []
     st.session_state.item_counter = 0
+    st.session_state.item_attachments = {}
+    st.session_state.pending_attachments = []
     # Clear team count cache
     get_team_physical_count_summary.clear()
     get_team_physical_counts_detail.clear()
@@ -403,7 +560,8 @@ def get_items_summary() -> Dict:
             'unique_products': 0,
             'total_batches': 0,
             'items_in_erp': 0,
-            'items_not_in_erp': 0
+            'items_not_in_erp': 0,
+            'total_attachments': 0
         }
     
     total_quantity = sum(item.get('actual_quantity', 0) for item in st.session_state.new_items_list)
@@ -416,63 +574,111 @@ def get_items_summary() -> Dict:
                        if item.get('product_id') is not None)
     items_not_in_erp = len(st.session_state.new_items_list) - items_in_erp
     
+    # Count attachments
+    total_attachments = sum(len(attachments) for attachments in st.session_state.item_attachments.values())
+    
     return {
         'total_items': len(st.session_state.new_items_list),
         'total_quantity': total_quantity,
         'unique_products': unique_products,
         'total_batches': total_batches,
         'items_in_erp': items_in_erp,
-        'items_not_in_erp': items_not_in_erp
+        'items_not_in_erp': items_not_in_erp,
+        'total_attachments': total_attachments
     }
 
 def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
-    """Save all physical items found in warehouse to database"""
+    """Save all physical items and attachments to database"""
     if not st.session_state.new_items_list:
         return 0, ["No items to save"]
     
-    # Prepare data for database
-    count_list = []
+    # Get transaction code for S3 organization
+    tx_info = audit_service.get_transaction_info(transaction_id)
+    transaction_code = tx_info.get('transaction_code', f'TXN_{transaction_id}')
+    
+    saved_count = 0
+    errors = []
+    
     for item in st.session_state.new_items_list:
-        # Handle expired_date conversion
-        expired_date = item.get('expired_date')
-        if expired_date:
-            try:
-                if isinstance(expired_date, str):
-                    expired_date = datetime.fromisoformat(expired_date).date()
-            except:
-                logger.warning(f"Failed to parse expiry date: {expired_date}")
-                expired_date = None
-        
-        # Create appropriate notes based on whether product exists in ERP
-        if item.get('product_id'):
-            # Physical item that exists in ERP product master
-            actual_notes = f"PHYSICAL COUNT - IN ERP: {item.get('reference_pt_code', '')} - {item.get('product_name', '')} - {item.get('notes', '')}"
-        else:
-            # Physical item NOT in ERP product master
-            actual_notes = f"PHYSICAL COUNT - NOT IN ERP: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}"
-        
-        count_data = {
-            'transaction_id': transaction_id,
-            'product_id': item.get('product_id'),  # Will be actual ID or None
-            'batch_no': item.get('batch_no', ''),
-            'expired_date': expired_date,
-            'zone_name': item.get('zone_name', ''),
-            'rack_name': item.get('rack_name', ''),
-            'bin_name': item.get('bin_name', ''),
-            'location_notes': item.get('location_notes', ''),
-            'system_quantity': 0,  # Always 0 for physical count items not in ERP inventory
-            'system_value_usd': 0,  # Always 0 for physical count items not in ERP inventory
-            'actual_quantity': item.get('actual_quantity', 0),
-            'actual_notes': actual_notes,
-            'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
-            'created_by_user_id': st.session_state.user_id
-        }
-        count_list.append(count_data)
+        try:
+            # Handle expired_date conversion
+            expired_date = item.get('expired_date')
+            if expired_date:
+                try:
+                    if isinstance(expired_date, str):
+                        expired_date = datetime.fromisoformat(expired_date).date()
+                except:
+                    logger.warning(f"Failed to parse expiry date: {expired_date}")
+                    expired_date = None
+            
+            # Create appropriate notes based on whether product exists in ERP
+            if item.get('product_id'):
+                # Physical item that exists in ERP product master
+                actual_notes = f"PHYSICAL COUNT - IN ERP: {item.get('reference_pt_code', '')} - {item.get('product_name', '')} - {item.get('notes', '')}"
+            else:
+                # Physical item NOT in ERP product master
+                actual_notes = f"PHYSICAL COUNT - NOT IN ERP: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}"
+            
+            count_data = {
+                'transaction_id': transaction_id,
+                'product_id': item.get('product_id'),  # Will be actual ID or None
+                'batch_no': item.get('batch_no', ''),
+                'expired_date': expired_date,
+                'zone_name': item.get('zone_name', ''),
+                'rack_name': item.get('rack_name', ''),
+                'bin_name': item.get('bin_name', ''),
+                'location_notes': item.get('location_notes', ''),
+                'system_quantity': 0,  # Always 0 for physical count items not in ERP inventory
+                'system_value_usd': 0,  # Always 0 for physical count items not in ERP inventory
+                'actual_quantity': item.get('actual_quantity', 0),
+                'actual_notes': actual_notes,
+                'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
+                'created_by_user_id': st.session_state.user_id
+            }
+            
+            # Save count
+            count_saved, count_errors = audit_service.save_batch_counts([count_data])
+            
+            if count_saved > 0:
+                saved_count += 1
+                
+                # Get the saved count ID (this is a simplified approach)
+                # In production, you might need a better way to get the actual count ID
+                # For now, we'll use the transaction_id to find the latest count
+                
+                # Upload attachments if any
+                temp_id = item.get('temp_id')
+                if temp_id and temp_id in st.session_state.item_attachments:
+                    # Get the latest count ID for this transaction and product
+                    # This is a workaround - ideally save_batch_counts would return IDs
+                    latest_count_query = """
+                    SELECT id FROM audit_count_details 
+                    WHERE transaction_id = :transaction_id
+                    AND created_by_user_id = :user_id
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                    
+                    engine = get_db_engine()
+                    with engine.connect() as conn:
+                        result = conn.execute(text(latest_count_query), {
+                            'transaction_id': transaction_id,
+                            'user_id': st.session_state.user_id
+                        })
+                        row = result.fetchone()
+                        
+                        if row:
+                            count_id = row.id
+                            attachments = st.session_state.item_attachments[temp_id]
+                            upload_count_attachments(count_id, attachments, transaction_code)
+            else:
+                errors.extend(count_errors)
+                
+        except Exception as e:
+            errors.append(f"Item {item.get('product_name', 'Unknown')}: {str(e)}")
+            logger.error(f"Error saving item: {e}")
     
-    # Save using batch save
-    saved, errors = audit_service.save_batch_counts(count_list)
-    
-    if saved > 0:
+    if saved_count > 0:
         st.session_state.last_save_time = datetime.now()
         clear_all_items()
         # Clear caches to refresh team data
@@ -481,7 +687,7 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
         get_team_top_products.clear()
         get_team_physical_count_for_product.clear()
     
-    return saved, errors
+    return saved_count, errors
 
 # ============== UI COMPONENTS ==============
 
@@ -502,7 +708,7 @@ def show_header():
             st.rerun()
 
 def show_summary_bar():
-    """Display summary statistics bar with team data"""
+    """Display summary statistics bar with team data and attachments"""
     # Get current user summary
     user_summary = get_items_summary()
     
@@ -516,13 +722,15 @@ def show_summary_bar():
     with col1:
         st.markdown("### 📋 Your Pending Items")
         if user_summary['total_items'] > 0:
-            subcol1, subcol2, subcol3 = st.columns(3)
+            subcol1, subcol2, subcol3, subcol4 = st.columns(4)
             with subcol1:
                 st.metric("Items", user_summary['total_items'])
             with subcol2:
                 st.metric("Quantity", f"{user_summary['total_quantity']:.0f}")
             with subcol3:
                 st.metric("Products", user_summary['unique_products'])
+            with subcol4:
+                st.metric("📎", user_summary['total_attachments'])
         else:
             st.info("No pending items")
     
@@ -596,7 +804,7 @@ def show_transaction_selector():
             # Show transaction info
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.info(f"📍 Warehouse: {selected_tx.get('warehouse_name', 'N/A')}")
+                st.info(f"🏢 Warehouse: {selected_tx.get('warehouse_name', 'N/A')}")
             with col2:
                 st.info(f"🏷️ Zones: {selected_tx.get('assigned_zones', 'All')}")
             with col3:
@@ -611,7 +819,7 @@ def show_transaction_selector():
         return None
 
 def show_entry_form():
-    """Show simplified entry form with auto clear and team count check"""
+    """Show simplified entry form with media upload"""
     st.markdown("### ✏️ Add Physical Item")
     
     # Initialize form key if not exists
@@ -792,6 +1000,27 @@ def show_entry_form():
             placeholder="Any observations, damage, special conditions, etc."
         )
         
+        # Media upload section
+        st.markdown("### 📎 Attachments (Optional)")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            uploaded_files = st.file_uploader(
+                "Upload Images/Documents",
+                type=ALLOWED_IMAGE_TYPES + ALLOWED_DOC_TYPES,
+                accept_multiple_files=True,
+                key=f"file_uploader_{st.session_state.form_key}",
+                help=f"Max {MAX_FILE_SIZE_MB}MB per file"
+            )
+        
+        with col2:
+            attachment_notes = st.text_area(
+                "Attachment Notes",
+                key=f"attachment_notes_{st.session_state.form_key}",
+                placeholder="Describe the attachments (optional)",
+                height=100
+            )
+        
         # Submit buttons
         col_submit, col_reset = st.columns([3, 1])
         
@@ -820,6 +1049,19 @@ def show_entry_form():
                 st.error("❌ Zone is required for location!")
             else:
                 try:
+                    # Process uploaded files
+                    if uploaded_files:
+                        st.session_state.pending_attachments = []
+                        for file in uploaded_files:
+                            valid, msg = validate_file(file)
+                            if valid:
+                                st.session_state.pending_attachments.append({
+                                    'file': file,
+                                    'description': attachment_notes
+                                })
+                            else:
+                                st.warning(f"⚠️ {file.name}: {msg}")
+                    
                     # Prepare item data
                     if selected_product:
                         # Product exists in ERP master data
@@ -850,10 +1092,11 @@ def show_entry_form():
                     add_new_item(item_data)
                     
                     # Success message
+                    attachment_count = len(st.session_state.pending_attachments) if hasattr(st.session_state, 'pending_attachments') else 0
                     if product_id:
-                        st.success(f"✅ Added: {selected_product['pt_code']} - {actual_product_name} (ID: {product_id}, Qty: {quantity})")
+                        st.success(f"✅ Added: {selected_product['pt_code']} - {actual_product_name} (ID: {product_id}, Qty: {quantity}, 📎 {attachment_count})")
                     else:
-                        st.success(f"✅ Added: {actual_product_name} - NOT IN ERP (Qty: {quantity})")
+                        st.success(f"✅ Added: {actual_product_name} - NOT IN ERP (Qty: {quantity}, 📎 {attachment_count})")
                     
                     # Update default location for next entry
                     st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
@@ -877,19 +1120,23 @@ def show_entry_form():
         if reset:
             # Reset product selector and form
             st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+            st.session_state.pending_attachments = []
             st.session_state.form_key += 1
             st.rerun()
 
 def show_items_preview():
-    """Display preview of pending items"""
+    """Display preview of pending items with attachments"""
     if not st.session_state.new_items_list:
         return
     
     st.markdown("### 📋 Pending Items")
     
-    # Display as a table
+    # Display as a table with attachment indicator
     items_data = []
     for item in st.session_state.new_items_list:
+        temp_id = item.get('temp_id')
+        attachment_count = len(st.session_state.item_attachments.get(temp_id, []))
+        
         items_data.append({
             'Type': '📦 ERP' if item.get('product_id') else '❓ New',
             'ID': item.get('product_id', '-'),
@@ -899,7 +1146,8 @@ def show_items_preview():
             'Batch': item.get('batch_no', '-'),
             'Quantity': f"{item.get('actual_quantity', 0):.0f}",
             'Location': f"{item.get('zone_name', '')}-{item.get('rack_name', '')}-{item.get('bin_name', '')}",
-            'temp_id': item.get('temp_id')
+            '📎': attachment_count if attachment_count > 0 else '-',
+            'temp_id': temp_id
         })
     
     # Create DataFrame
@@ -907,7 +1155,7 @@ def show_items_preview():
     
     # Display with action column
     for idx, row in df.iterrows():
-        col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns([1, 1, 3, 2, 2, 2, 2, 2, 1])
+        col1, col2, col3, col4, col5, col6, col7, col8, col9, col10 = st.columns([1, 1, 3, 2, 2, 2, 2, 2, 1, 1])
         
         with col1:
             st.write(row['Type'])
@@ -926,12 +1174,147 @@ def show_items_preview():
         with col8:
             st.write(row['Location'])
         with col9:
+            st.write(str(row['📎']))
+        with col10:
             if st.button("🗑️", key=f"del_{row['temp_id']}", help="Remove"):
                 remove_item(row['temp_id'])
                 st.rerun()
         
+        # Show attachments if expanded
+        if row['📎'] != '-':
+            with st.expander(f"View {row['📎']} attachments", expanded=False):
+                attachments = st.session_state.item_attachments.get(row['temp_id'], [])
+                display_attachment_preview(attachments)
+        
         if idx < len(df) - 1:
             st.divider()
+
+def show_media_gallery():
+    """Display media gallery for physical count items"""
+    st.subheader("📸 Media Gallery - Physical Count")
+    
+    if 'selected_session_id' not in st.session_state:
+        st.warning("⚠️ Please select a session first")
+        return
+    
+    # Get session info
+    session_info = audit_service.get_session_info(st.session_state.selected_session_id)
+    if not session_info:
+        st.error("Session not found")
+        return
+    
+    st.info(f"**Session:** {session_info['session_name']} ({session_info['session_code']})")
+    
+    # Filter options
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Get user's transactions
+        user_transactions = audit_service.get_user_transactions(
+            st.session_state.selected_session_id,
+            st.session_state.user_id
+        )
+        
+        tx_filter = st.selectbox(
+            "Filter by Transaction",
+            ["All"] + [f"{tx['transaction_name']} ({tx['transaction_code']})" for tx in user_transactions]
+        )
+    
+    with col2:
+        media_type_filter = st.selectbox(
+            "Filter by Type",
+            ["All", "Images", "Documents"]
+        )
+    
+    with col3:
+        if st.button("🔄 Refresh Gallery", use_container_width=True):
+            st.rerun()
+    
+    # Get attachments for physical count items
+    try:
+        all_attachments = []
+        
+        for tx in user_transactions:
+            if tx_filter != "All" and tx['transaction_code'] not in tx_filter:
+                continue
+            
+            # Get physical counts for this transaction
+            query = """
+            SELECT acd.*, p.name as product_name, p.pt_code
+            FROM audit_count_details acd
+            LEFT JOIN products p ON acd.product_id = p.id
+            WHERE acd.transaction_id = :transaction_id
+            AND acd.is_new_item = 1
+            AND acd.delete_flag = 0
+            ORDER BY acd.counted_date DESC
+            """
+            
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                result = conn.execute(text(query), {"transaction_id": tx['id']})
+                counts = [dict(row._mapping) for row in result.fetchall()]
+            
+            for count in counts:
+                # Get attachments for each count
+                attachments = audit_service.get_entity_attachments('count_detail', count['id'])
+                
+                for att in attachments:
+                    # Apply type filter
+                    if media_type_filter == "Images" and att.get('file_type') != 'image':
+                        continue
+                    elif media_type_filter == "Documents" and att.get('file_type') != 'document':
+                        continue
+                    
+                    # Add metadata
+                    att['transaction_name'] = tx['transaction_name']
+                    att['product_name'] = count.get('product_name') or 'Not in ERP'
+                    att['pt_code'] = count.get('pt_code', 'N/A')
+                    att['batch_no'] = count.get('batch_no', 'N/A')
+                    att['counted_date'] = count.get('counted_date')
+                    att['location'] = f"{count.get('zone_name', '')}-{count.get('rack_name', '')}-{count.get('bin_name', '')}"
+                    
+                    # Generate presigned URL
+                    att['s3_url'] = s3_manager.get_presigned_url(att['s3_key'], expiration=3600)
+                    
+                    all_attachments.append(att)
+        
+        if all_attachments:
+            st.markdown(f"### Found {len(all_attachments)} attachments")
+            
+            # Display in grid
+            cols = st.columns(3)
+            for idx, att in enumerate(all_attachments):
+                with cols[idx % 3]:
+                    with st.container():
+                        if att['pt_code'] != 'N/A':
+                            st.markdown(f"**📦 {att['pt_code']} - {att['product_name']}**")
+                        else:
+                            st.markdown(f"**❓ {att['product_name']}**")
+                        
+                        st.caption(f"Batch: {att['batch_no']} | Loc: {att['location']}")
+                        st.caption(f"Transaction: {att['transaction_name']}")
+                        
+                        if att['file_type'] == 'image' and att['s3_url']:
+                            st.image(att['s3_url'], use_column_width=True)
+                        else:
+                            st.write(f"📄 {att['file_name']}")
+                        
+                        st.caption(f"Uploaded by: {att.get('uploaded_by_name', att.get('uploaded_by_username', 'Unknown'))}")
+                        st.caption(f"Date: {pd.to_datetime(att['uploaded_date']).strftime('%m/%d %H:%M')}")
+                        
+                        if att.get('description'):
+                            st.caption(f"Note: {att['description']}")
+                        
+                        if att['s3_url']:
+                            st.markdown(f"[📥 Download]({att['s3_url']})")
+                        
+                        st.markdown("---")
+        else:
+            st.info("No media attachments found for physical count items")
+            
+    except Exception as e:
+        st.error(f"Error loading media gallery: {str(e)}")
+        logger.error(f"Media gallery error: {e}")
 
 def export_items_to_csv():
     """Export items to CSV"""
@@ -949,6 +1332,9 @@ def export_items_to_csv():
             except:
                 pass
         
+        temp_id = item.get('temp_id')
+        attachment_count = len(st.session_state.item_attachments.get(temp_id, []))
+        
         df_data.append({
             'ERP Status': 'In ERP Master' if item.get('product_id') else 'Not in ERP',
             'Product ID': item.get('product_id', ''),
@@ -963,6 +1349,7 @@ def export_items_to_csv():
             'Rack': item.get('rack_name', ''),
             'Bin': item.get('bin_name', ''),
             'Notes': item.get('notes', ''),
+            'Attachments': attachment_count,
             'Added Time': item.get('added_time', '').strftime('%Y-%m-%d %H:%M:%S') if item.get('added_time') else ''
         })
     
@@ -982,7 +1369,7 @@ def handle_save_action(transaction_id: int):
     if 'trigger_save' in st.session_state and st.session_state.trigger_save:
         st.session_state.trigger_save = False
         
-        with st.spinner(f"Saving {len(st.session_state.new_items_list)} items..."):
+        with st.spinner(f"Saving {len(st.session_state.new_items_list)} items and uploading attachments..."):
             progress_bar = st.progress(0)
             
             # Simulate progress
@@ -1003,7 +1390,7 @@ def handle_save_action(transaction_id: int):
             elif errors and saved > 0:
                 st.warning(f"⚠️ Saved {saved} items with {len(errors)} errors")
             else:
-                st.success(f"✅ Successfully saved {saved} items!")
+                st.success(f"✅ Successfully saved {saved} items with attachments!")
                 st.balloons()
                 time.sleep(1)
                 st.rerun()
@@ -1118,7 +1505,7 @@ def main():
 
 def show_login_page():
     """Display login page"""
-    st.title("🔐 Login - Warehouse Physical Count")
+    st.title("🔑 Login - Warehouse Physical Count")
     
     col1, col2, col3 = st.columns([1, 2, 1])
     
@@ -1157,7 +1544,7 @@ def show_main_app():
             st.markdown("---")
         
         # Main content in tabs
-        tab1, tab2, tab3 = st.tabs(["📝 Add Items", "📋 Review & Save", "📊 Team Statistics"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📝 Add Items", "📋 Review & Save", "📊 Team Statistics", "📸 Media Gallery"])
         
         with tab1:
             # Entry form
@@ -1168,6 +1555,8 @@ def show_main_app():
                 st.markdown("### 📦 Quick Preview")
                 summary = get_items_summary()
                 st.metric("Pending Items", summary['total_items'])
+                if summary['total_attachments'] > 0:
+                    st.metric("📎 Attachments", summary['total_attachments'])
                 
                 if st.session_state.new_items_list:
                     for item in st.session_state.new_items_list[-5:]:  # Show last 5
@@ -1175,6 +1564,13 @@ def show_main_app():
                         product_info = f"{item['product_name'][:20]}..."
                         if item.get('product_id'):
                             product_info += f" (ID: {item['product_id']})"
+                        
+                        # Check attachments
+                        temp_id = item.get('temp_id')
+                        att_count = len(st.session_state.item_attachments.get(temp_id, []))
+                        if att_count > 0:
+                            product_info += f" 📎{att_count}"
+                        
                         st.caption(f"{status} {product_info} - Qty: {item['actual_quantity']:.0f}")
                 
                 # Clear cache button
@@ -1188,20 +1584,27 @@ def show_main_app():
             # Items preview
             show_items_preview()
             
-            # Save section
+            # Export and Save section
             if st.session_state.new_items_list:
                 st.markdown("---")
-                col1, col2 = st.columns([3, 1])
+                col1, col2, col3 = st.columns([2, 1, 1])
                 
                 with col1:
-                    st.info(f"💡 Ready to save {len(st.session_state.new_items_list)} items to transaction")
+                    summary = get_items_summary()
+                    st.info(f"💡 Ready to save {summary['total_items']} items ({summary['total_attachments']} attachments) to transaction")
                 
                 with col2:
+                    export_items_to_csv()
+                
+                with col3:
                     if st.button("💾 Save to Database", use_container_width=True, type="primary"):
                         st.session_state.trigger_save = True
         
         with tab3:
             show_statistics()
+        
+        with tab4:
+            show_media_gallery()
         
         # Handle save action
         handle_save_action(transaction_id)
