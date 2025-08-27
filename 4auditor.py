@@ -1,10 +1,12 @@
-# 4auditor.py - Enhanced Warehouse Audit System with Media Attachments
+# for_auditor.py - Enhanced Physical Count with Media Attachments
+# Records both existing products found in warehouse and new items not in ERP
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
-from functools import lru_cache
+import json
 from sqlalchemy import text
 import mimetypes
 import os
@@ -15,8 +17,8 @@ from utils.config import config
 from utils.db import get_db_engine
 from utils.s3_utils import S3Manager
 
-# Import our services
-from audit_service import AuditService, AuditException, SessionNotFoundException, InvalidTransactionStateException, CountValidationException
+# Import services
+from audit_service import AuditService, AuditException
 from audit_queries import AuditQueries
 
 # Setup logging
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Page config
 st.set_page_config(
-    page_title="Warehouse Audit System",
+    page_title="Warehouse Physical Count",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -34,7 +36,6 @@ st.set_page_config(
 # Initialize services
 auth = AuthManager()
 audit_service = AuditService()
-queries = AuditQueries()
 s3_manager = S3Manager()
 
 # ============== CONSTANTS ==============
@@ -42,118 +43,42 @@ ALLOWED_IMAGE_TYPES = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
 ALLOWED_DOC_TYPES = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt']
 MAX_FILE_SIZE_MB = 10
 
-# ============== SIMPLIFIED SESSION STATE ==============
-
+# ============== SESSION STATE INITIALIZATION ==============
 def init_session_state():
-    """Initialize session state variables"""
-    defaults = {
-        # Core states
-        'temp_counts': [],
-        'selected_product': None,
-        'selected_batch': None,
-        'form_batch_no': '',
-        'form_location': '',
-        'form_expiry': None,
-        
-        # UI feedback
-        'last_action': None,
-        'last_action_time': None,
-        
-        # Cache keys
-        'products_map': {},
-        'batches_map': {},
-        
-        # Display control
-        'show_teamwork_view': False,
-        'show_attachments': {},
-        
-        # Loading states
-        'products_loaded': False,
-        'current_warehouse_id': None,
-        'product_options': ["-- Select Product --"],
-        
-        # Media attachments
-        'pending_attachments': [],  # Temporary storage for files before saving
-        'count_attachments': {},  # Map count index to attachments
-    }
+    """Initialize all session state variables"""
+    if 'new_items_list' not in st.session_state:
+        st.session_state.new_items_list = []
     
-    for key, default in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = default
-
-# ============== CACHE FUNCTIONS ==============
-
-@st.cache_data(ttl=3600)
-def cached_get_warehouses():
-    """Cached wrapper for get_warehouses"""
-    return audit_service.get_warehouses()
-
-@st.cache_data(ttl=1800)
-def get_warehouse_products(warehouse_id: int):
-    """Cached get warehouse products"""
-    return audit_service.get_warehouse_products(warehouse_id)
-
-@st.cache_data(ttl=900)
-def get_product_batches(warehouse_id: int, product_id: int):
-    """Cached get product batch details"""
-    return audit_service.get_product_batch_details(warehouse_id, product_id)
-
-@st.cache_data(ttl=600)
-def get_count_summary(transaction_id: int):
-    """Cached get transaction count summary"""
-    return audit_service.get_transaction_count_summary(transaction_id)
-
-@st.cache_data(ttl=300)
-def get_sessions_by_status(status: str):
-    """Cached get sessions by status"""
-    return audit_service.get_sessions_by_status(status)
-
-@st.cache_data(ttl=300)
-def get_session_product_summary(session_id: int, product_id: int):
-    """Get total counts for a product across all transactions in session"""
-    return audit_service.get_product_total_summary(session_id, product_id)
-
-@st.cache_data(ttl=300)
-def get_all_products_team_summary(session_id: int):
-    """Get team count summary for all products in session"""
-    try:
-        # Get summary for all products at once
-        engine = get_db_engine()
-        query = """
-        SELECT 
-            acd.product_id,
-            COUNT(DISTINCT acd.transaction_id) as total_transactions,
-            COUNT(DISTINCT acd.created_by_user_id) as total_users,
-            COUNT(DISTINCT acd.batch_no) as total_batches,
-            COUNT(*) as total_count_records,
-            SUM(acd.actual_quantity) as grand_total_counted
-        FROM audit_count_details acd
-        JOIN audit_transactions at ON acd.transaction_id = at.id
-        WHERE at.session_id = :session_id
-        AND acd.delete_flag = 0
-        AND at.delete_flag = 0
-        GROUP BY acd.product_id
-        """
-        
-        with engine.connect() as conn:
-            result = conn.execute(text(query), {"session_id": session_id})
-            rows = result.fetchall()
-            
-            # Convert to dictionary keyed by product_id
-            summary_dict = {}
-            for row in rows:
-                summary_dict[row.product_id] = {
-                    'total_transactions': row.total_transactions,
-                    'total_users': row.total_users,
-                    'total_batches': row.total_batches,
-                    'total_count_records': row.total_count_records,
-                    'grand_total_counted': float(row.grand_total_counted) if row.grand_total_counted else 0
-                }
-            
-            return summary_dict
-    except Exception as e:
-        logger.error(f"Error getting all products team summary: {e}")
-        return {}
+    if 'item_counter' not in st.session_state:
+        st.session_state.item_counter = 0
+    
+    if 'last_save_time' not in st.session_state:
+        st.session_state.last_save_time = None
+    
+    if 'show_preview' not in st.session_state:
+        st.session_state.show_preview = True
+    
+    if 'default_location' not in st.session_state:
+        st.session_state.default_location = {'zone': '', 'rack': '', 'bin': ''}
+    
+    if 'form_data' not in st.session_state:
+        st.session_state.form_data = {}
+    
+    if 'product_selector' not in st.session_state:
+        st.session_state.product_selector = "-- Not in ERP / New Product --"
+    
+    if 'show_team_counts' not in st.session_state:
+        st.session_state.show_team_counts = False
+    
+    # Media attachment states
+    if 'pending_attachments' not in st.session_state:
+        st.session_state.pending_attachments = []
+    
+    if 'item_attachments' not in st.session_state:
+        st.session_state.item_attachments = {}
+    
+    if 'show_media_gallery' not in st.session_state:
+        st.session_state.show_media_gallery = False
 
 # ============== MEDIA HANDLING FUNCTIONS ==============
 
@@ -194,33 +119,8 @@ def get_file_type(filename: str) -> str:
     else:
         return 'other'
 
-def display_attachment_preview(attachment: Dict):
-    """Display attachment preview based on type"""
-    file_type = attachment.get('file_type', 'other')
-    
-    col1, col2, col3 = st.columns([1, 3, 1])
-    
-    with col1:
-        if file_type == 'image':
-            st.write("🖼️ Image")
-        else:
-            st.write("📄 Document")
-    
-    with col2:
-        st.write(f"**{attachment.get('file_name', 'Unknown')}**")
-        st.caption(f"Size: {attachment.get('file_size_mb', 0):.2f}MB")
-        if attachment.get('description'):
-            st.caption(f"Note: {attachment['description']}")
-    
-    with col3:
-        if file_type == 'image' and attachment.get('s3_url'):
-            if st.button("👁️ View", key=f"view_{attachment['id']}"):
-                st.image(attachment['s3_url'], caption=attachment['file_name'])
-        elif attachment.get('s3_url'):
-            st.markdown(f"[📥 Download]({attachment['s3_url']})")
-
 def upload_count_attachments(count_id: int, attachments: List[Dict], transaction_code: str) -> List[Dict]:
-    """Upload attachments for a count detail"""
+    """Upload attachments for a physical count detail"""
     uploaded = []
     
     for attachment in attachments:
@@ -266,7 +166,7 @@ def upload_count_attachments(count_id: int, attachments: List[Dict], transaction
                 attachment_data['id'] = attachment_id
                 uploaded.append(attachment_data)
                 
-                logger.info(f"Uploaded attachment {file_name} for count {count_id}")
+                logger.info(f"Uploaded attachment {file_name} for physical count {count_id}")
             else:
                 st.error(f"Failed to upload {file_name}: {s3_key}")
                 
@@ -276,151 +176,245 @@ def upload_count_attachments(count_id: int, attachments: List[Dict], transaction
     
     return uploaded
 
-# ============== OPTIMIZED CALLBACKS ==============
-
-def on_product_change():
-    """Callback when product is selected"""
-    selected = st.session_state.product_select
-    if selected and selected != "-- Select Product --":
-        # Prevent unnecessary updates
-        product_data = st.session_state.products_map.get(selected)
-        if product_data and (not st.session_state.selected_product or 
-                           st.session_state.selected_product.get('product_id') != product_data.get('product_id')):
-            st.session_state.selected_product = product_data
-            st.session_state.selected_batch = None
-            st.session_state.form_batch_no = ''
-            st.session_state.form_location = ''
-            st.session_state.form_expiry = None
-
-def on_batch_change():
-    """Callback when batch is selected"""
-    selected = st.session_state.batch_select
-    if selected and selected != "-- Manual Entry --":
-        batch_no = selected.split(" (")[0].replace("🔴", "").replace("🟡", "").replace("🟢", "").strip()
-        batch_data = st.session_state.batches_map.get(batch_no)
-        if batch_data:
-            st.session_state.selected_batch = batch_data
-            st.session_state.form_batch_no = batch_no
-            st.session_state.form_location = batch_data.get('location', '')
-            if batch_data.get('expired_date'):
-                try:
-                    st.session_state.form_expiry = pd.to_datetime(batch_data['expired_date']).date()
-                except:
-                    st.session_state.form_expiry = None
-    else:
-        st.session_state.selected_batch = None
-        st.session_state.form_batch_no = ''
-        st.session_state.form_location = ''
-        st.session_state.form_expiry = None
-
-def add_count_callback():
-    """Add count to temporary list with attachments"""
-    qty = st.session_state.get('qty_input', 0)
-    batch_no = st.session_state.get('batch_input', '')
-    location = st.session_state.get('loc_input', '')
-    notes = st.session_state.get('notes_input', '')
-    expiry = st.session_state.get('expiry_input', None)
+def display_attachment_preview(attachments: List[Dict]):
+    """Display preview of pending attachments"""
+    if not attachments:
+        return
     
-    if qty > 0 and st.session_state.selected_product:
-        # Parse location
-        zone, rack, bin = '', '', ''
-        if location and '-' in location:
-            parts = location.split('-', 2)
-            zone = parts[0].strip() if len(parts) > 0 else ''
-            rack = parts[1].strip() if len(parts) > 1 else ''
-            bin = parts[2].strip() if len(parts) > 2 else ''
-        else:
-            zone = location.strip() if location else ''
+    st.markdown(f"**📎 {len(attachments)} attachments**")
+    
+    for att in attachments:
+        file = att['file']
+        file_type = get_file_type(file.name)
         
-        # Create count data
-        count = {
-            'transaction_id': st.session_state.tx_id,
-            'product_id': st.session_state.selected_product['product_id'],
-            'product_name': st.session_state.selected_product['product_name'],
-            'pt_code': st.session_state.selected_product.get('pt_code', ''),
-            'batch_no': batch_no,
-            'expired_date': expiry,
-            'zone_name': zone,
-            'rack_name': rack,
-            'bin_name': bin,
-            'location_notes': '',
-            'system_quantity': st.session_state.selected_batch['quantity'] if st.session_state.selected_batch else 0,
-            'system_value_usd': st.session_state.selected_batch.get('value_usd', 0) if st.session_state.selected_batch else 0,
-            'actual_quantity': qty,
-            'actual_notes': notes,
-            'created_by_user_id': st.session_state.user_id,
-            'time': datetime.now().strftime('%H:%M:%S')
-        }
-        
-        count_index = len(st.session_state.temp_counts)
-        st.session_state.temp_counts.append(count)
-        
-        # Store pending attachments for this count
-        if st.session_state.pending_attachments:
-            st.session_state.count_attachments[count_index] = st.session_state.pending_attachments.copy()
-            st.session_state.pending_attachments = []
-        
-        st.session_state.last_action = f"✅ Added count #{count_index + 1}"
-        st.session_state.last_action_time = datetime.now()
-        
-        # Clear form inputs
-        st.session_state.qty_input = 0
-        st.session_state.notes_input = ''
-
-def save_counts_callback():
-    """Save all counts to database with attachments"""
-    if st.session_state.temp_counts:
-        try:
-            st.session_state.last_action = "💾 Saving counts and uploading media..."
-            
-            # Get transaction code for S3 organization
-            tx_info = audit_service.get_transaction_info(st.session_state.tx_id)
-            transaction_code = tx_info.get('transaction_code', f'TXN_{st.session_state.tx_id}')
-            
-            # Save counts and get IDs
-            saved_ids, errors = audit_service.save_batch_counts(st.session_state.temp_counts)
-            
-            # Upload attachments for each successfully saved count
-            for idx, (count_data, count_id) in enumerate(zip(st.session_state.temp_counts, saved_ids)):
-                if count_id and idx in st.session_state.count_attachments:
-                    attachments = st.session_state.count_attachments[idx]
-                    # count_id is the entity_id for entity_type='count_detail'
-                    upload_count_attachments(count_id, attachments, transaction_code)
-            
-            # Count successful saves
-            successful_saves = len([id for id in saved_ids if id is not None])
-            
-            if errors and successful_saves == 0:
-                st.session_state.last_action = f"❌ Failed to save items: {errors[0]}"
-            elif errors:
-                st.session_state.last_action = f"⚠️ Saved {successful_saves} counts with {len(errors)} errors"
-                for error in errors[:3]:  # Show first 3 errors
-                    st.caption(f"• {error}")
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if file_type == 'image':
+                st.write("🖼️")
             else:
-                st.session_state.last_action = f"✅ Successfully saved {successful_saves} counts!"
-                st.session_state.temp_counts = []
-                st.session_state.count_attachments = {}
-                # Clear relevant caches
-                get_count_summary.clear()
-                get_session_product_summary.clear()
-                get_all_products_team_summary.clear()
-                # Force reload of products to update status
-                st.session_state.products_loaded = False
-            
-            st.session_state.last_action_time = datetime.now()
-            
-        except Exception as e:
-            st.session_state.last_action = f"❌ Error: {str(e)}"
-            st.session_state.last_action_time = datetime.now()
-            logger.error(f"Save error: {e}")
+                st.write("📄")
+        
+        with col2:
+            st.caption(f"{file.name} ({file.size / 1024:.1f}KB)")
+            if att.get('description'):
+                st.caption(f"Note: {att['description']}")
 
-# ============== DISPLAY FUNCTIONS ==============
+# ============== CACHE FUNCTIONS ==============
 
-def display_teamwork_counts(session_id: int, product_id: int, current_tx_id: int):
-    """Display all counts for a product across all transactions with attachments"""
+@st.cache_data(ttl=3600)
+def get_all_products():
+    """Get all active products from database"""
     try:
-        # Get all counts
-        all_counts = audit_service.get_product_counts_all_transactions(session_id, product_id)
+        query = """
+        SELECT 
+            p.id,
+            p.name as product_name,
+            p.pt_code,
+            COALESCE(p.legacy_pt_code, '') as legacy_code,
+            COALESCE(p.package_size, '') as package_size,
+            p.brand_id,
+            COALESCE(b.brand_name, '') as brand_name
+        FROM products p
+        LEFT JOIN brands b ON p.brand_id = b.id
+        WHERE p.delete_flag = 0
+        ORDER BY p.pt_code, p.name
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query))
+            products = [dict(row._mapping) for row in result.fetchall()]
+            logger.info(f"Loaded {len(products)} products from database")
+            return products
+    except Exception as e:
+        logger.error(f"Error getting products: {e}")
+        st.error(f"Failed to load products: {str(e)}")
+        return []
+
+@st.cache_data(ttl=300)
+def get_team_physical_count_summary(session_id: int):
+    """Get team-wide physical count summary"""
+    try:
+        query = """
+        SELECT 
+            COUNT(DISTINCT acd.created_by_user_id) as total_users,
+            COUNT(DISTINCT acd.transaction_id) as total_transactions,
+            COUNT(*) as total_items,
+            SUM(acd.actual_quantity) as total_quantity,
+            COUNT(DISTINCT acd.product_id) as products_in_erp,
+            COUNT(DISTINCT CASE WHEN acd.product_id IS NULL THEN acd.actual_notes END) as products_not_in_erp,
+            COUNT(DISTINCT CASE WHEN acd.product_id IS NOT NULL THEN acd.product_id END) as unique_erp_products,
+            MIN(acd.counted_date) as first_counted,
+            MAX(acd.counted_date) as last_counted
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        WHERE at.session_id = :session_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id})
+            row = result.fetchone()
+            
+            if row:
+                return {
+                    'total_users': row.total_users or 0,
+                    'total_transactions': row.total_transactions or 0,
+                    'total_items': row.total_items or 0,
+                    'total_quantity': float(row.total_quantity) if row.total_quantity else 0,
+                    'products_in_erp': row.products_in_erp or 0,
+                    'products_not_in_erp': row.products_not_in_erp or 0,
+                    'unique_erp_products': row.unique_erp_products or 0,
+                    'first_counted': row.first_counted,
+                    'last_counted': row.last_counted
+                }
+            return {}
+    except Exception as e:
+        logger.error(f"Error getting team summary: {e}")
+        return {}
+
+@st.cache_data(ttl=300)
+def get_team_physical_count_for_product(session_id: int, product_id: int):
+    """Get team physical count summary for a specific product"""
+    try:
+        query = """
+        SELECT 
+            COUNT(DISTINCT acd.created_by_user_id) as total_users,
+            COUNT(DISTINCT acd.transaction_id) as total_transactions,
+            COUNT(*) as total_records,
+            SUM(acd.actual_quantity) as total_quantity,
+            MIN(acd.counted_date) as first_counted,
+            MAX(acd.counted_date) as last_counted,
+            GROUP_CONCAT(DISTINCT u.username) as users_list,
+            GROUP_CONCAT(DISTINCT at.transaction_code) as transaction_codes
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        JOIN users u ON acd.created_by_user_id = u.id
+        WHERE at.session_id = :session_id
+        AND acd.product_id = :product_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {
+                "session_id": session_id, 
+                "product_id": product_id
+            })
+            row = result.fetchone()
+            
+            if row and row.total_records:
+                return {
+                    'total_users': row.total_users or 0,
+                    'total_transactions': row.total_transactions or 0,
+                    'total_records': row.total_records or 0,
+                    'total_quantity': float(row.total_quantity) if row.total_quantity else 0,
+                    'first_counted': row.first_counted,
+                    'last_counted': row.last_counted,
+                    'users_list': row.users_list.split(',') if row.users_list else [],
+                    'transaction_codes': row.transaction_codes.split(',') if row.transaction_codes else []
+                }
+            return None
+    except Exception as e:
+        logger.error(f"Error getting team product count: {e}")
+        return None
+
+@st.cache_data(ttl=300)
+def get_team_physical_counts_detail(session_id: int):
+    """Get detailed team physical counts grouped by transaction"""
+    try:
+        query = """
+        SELECT 
+            acd.transaction_id,
+            at.transaction_code,
+            at.transaction_name,
+            at.status as transaction_status,
+            u.username as counted_by,
+            CONCAT(e.first_name, ' ', e.last_name) as counter_name,
+            acd.product_id,
+            COALESCE(p.name, SUBSTRING_INDEX(acd.actual_notes, ' - ', -1)) as product_name,
+            COALESCE(p.pt_code, 'N/A') as pt_code,
+            acd.batch_no,
+            acd.actual_quantity,
+            acd.zone_name,
+            acd.rack_name,
+            acd.bin_name,
+            acd.actual_notes,
+            acd.counted_date,
+            acd.id as count_detail_id,
+            CASE 
+                WHEN acd.product_id IS NOT NULL THEN 'IN_ERP'
+                ELSE 'NOT_IN_ERP'
+            END as item_type
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        JOIN users u ON acd.created_by_user_id = u.id
+        LEFT JOIN employees e ON u.employee_id = e.id
+        LEFT JOIN products p ON acd.product_id = p.id
+        WHERE at.session_id = :session_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        ORDER BY at.transaction_code, acd.counted_date DESC
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id})
+            return [dict(row._mapping) for row in result.fetchall()]
+    except Exception as e:
+        logger.error(f"Error getting team detail counts: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def get_team_top_products(session_id: int, limit: int = 10):
+    """Get top products by team quantity"""
+    try:
+        query = """
+        SELECT 
+            CASE 
+                WHEN acd.product_id IS NOT NULL THEN p.name
+                ELSE SUBSTRING_INDEX(acd.actual_notes, ' - ', -1)
+            END as product_name,
+            CASE 
+                WHEN acd.product_id IS NOT NULL THEN p.pt_code
+                ELSE 'NOT_IN_ERP'
+            END as pt_code,
+            COUNT(*) as count_records,
+            SUM(acd.actual_quantity) as total_quantity,
+            COUNT(DISTINCT acd.created_by_user_id) as unique_users
+        FROM audit_count_details acd
+        JOIN audit_transactions at ON acd.transaction_id = at.id
+        LEFT JOIN products p ON acd.product_id = p.id
+        WHERE at.session_id = :session_id
+        AND acd.is_new_item = 1
+        AND acd.delete_flag = 0
+        AND at.delete_flag = 0
+        GROUP BY acd.product_id, product_name, pt_code
+        ORDER BY total_quantity DESC
+        LIMIT :limit
+        """
+        
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"session_id": session_id, "limit": limit})
+            return [dict(row._mapping) for row in result.fetchall()]
+    except Exception as e:
+        logger.error(f"Error getting top products: {e}")
+        return []
+
+# ============== TEAM COUNT DISPLAY FUNCTIONS ==============
+
+def display_team_physical_counts(session_id: int, current_tx_id: int):
+    """Display all team physical counts with attachment indicators"""
+    try:
+        # Get detailed counts
+        all_counts = get_team_physical_counts_detail(session_id)
         
         if all_counts:
             # Group by transaction
@@ -438,9 +432,12 @@ def display_teamwork_counts(session_id: int, product_id: int, current_tx_id: int
             
             # Display each transaction
             for tx_id, tx_data in transactions.items():
-                tx_total_qty = sum(c['total_counted'] for c in tx_data['counts'])
-                tx_total_records = sum(c['count_records'] for c in tx_data['counts'])
+                # Calculate transaction totals
+                tx_total_qty = sum(c['actual_quantity'] for c in tx_data['counts'])
+                tx_total_items = len(tx_data['counts'])
                 tx_users = len(set(c['counted_by'] for c in tx_data['counts']))
+                tx_in_erp = sum(1 for c in tx_data['counts'] if c['item_type'] == 'IN_ERP')
+                tx_not_in_erp = tx_total_items - tx_in_erp
                 
                 is_current = (tx_id == current_tx_id)
                 status_emoji = "✅" if tx_data['transaction_status'] == 'completed' else "📝"
@@ -448,156 +445,532 @@ def display_teamwork_counts(session_id: int, product_id: int, current_tx_id: int
                 
                 st.markdown(f"### {status_emoji} {tx_data['transaction_code']} - {tx_data['transaction_name']}{current_indicator}")
                 
-                col1, col2, col3 = st.columns(3)
+                # Transaction metrics
+                col1, col2, col3, col4, col5 = st.columns(5)
                 with col1:
                     st.metric("👥 Users", tx_users)
                 with col2:
-                    st.metric("📊 Records", tx_total_records)
+                    st.metric("📊 Items", tx_total_items)
                 with col3:
-                    st.metric("📢 Total", f"{tx_total_qty:.0f}")
+                    st.metric("📢 Total Qty", f"{tx_total_qty:.0f}")
+                with col4:
+                    st.metric("📦 In ERP", tx_in_erp)
+                with col5:
+                    st.metric("❓ Not in ERP", tx_not_in_erp)
                 
-                # Show count details
-                for count in tx_data['counts']:
-                    with st.container():
-                        col1, col2, col3, col4 = st.columns([2, 1.5, 1, 2.5])
+                # Show count details in expandable section
+                with st.expander(f"View {len(tx_data['counts'])} items", expanded=is_current):
+                    for count in tx_data['counts']:
+                        # Check for attachments
+                        attachments = audit_service.get_entity_attachments('count_detail', count['count_detail_id'])
+                        has_attachments = len(attachments) > 0
+                        
+                        col1, col2, col3, col4, col5, col6 = st.columns([2, 2, 1, 1, 2, 1])
                         
                         with col1:
                             st.write(f"**{count['counter_name'] or count['counted_by']}**")
                             st.caption(f"@{count['counted_by']}")
                         
                         with col2:
-                            st.write(f"Batch: {count['batch_no'] or 'N/A'}")
-                            st.caption(f"{count['count_records']} records")
+                            if count['item_type'] == 'IN_ERP':
+                                st.write(f"📦 {count['pt_code']} - {count['product_name']}")
+                            else:
+                                st.write(f"❓ {count['product_name']}")
+                            st.caption(f"Batch: {count['batch_no'] or 'N/A'}")
                         
                         with col3:
-                            st.write(f"Qty: {count['total_counted']:.0f}")
+                            st.write(f"Qty: {count['actual_quantity']:.0f}")
                         
                         with col4:
-                            locations = count['locations'].split(',') if count['locations'] else []
-                            st.write(f"📍 {len(locations)} locations")
-                            st.caption(f"Last: {pd.to_datetime(count['last_counted']).strftime('%H:%M')}")
+                            location = f"{count['zone_name']}-{count['rack_name']}-{count['bin_name']}"
+                            st.write(f"📍 {location}")
+                        
+                        with col5:
+                            st.caption(pd.to_datetime(count['counted_date']).strftime('%Y-%m-%d %H:%M'))
+                        
+                        with col6:
+                            if has_attachments:
+                                st.write(f"📎 {len(attachments)}")
                 
                 st.markdown("---")
-                
         else:
-            st.info("No counts recorded for this product yet")
+            st.info("No physical counts recorded by team yet")
             
     except Exception as e:
-        st.error(f"Error loading teamwork view: {str(e)}")
+        st.error(f"Error loading team counts: {str(e)}")
 
-def render_temp_counts():
-    """Display temporary counts with attachments"""
-    if st.session_state.temp_counts:
-        st.markdown(f"### 📋 Pending Counts ({len(st.session_state.temp_counts)})")
-        
-        # Group by product
-        grouped = {}
-        for count in st.session_state.temp_counts:
-            key = count['product_id']
-            if key not in grouped:
-                grouped[key] = {
-                    'product_name': count['product_name'],
-                    'counts': []
-                }
-            grouped[key]['counts'].append(count)
-        
-        # Display grouped
-        for product_id, group in grouped.items():
-            total_qty = sum(c['actual_quantity'] for c in group['counts'])
-            st.markdown(f"**{group['product_name']}** - {len(group['counts'])} records, Total: {total_qty:.0f}")
-            
-            for i, count in enumerate(group['counts']):
-                idx = st.session_state.temp_counts.index(count)
-                
-                with st.expander(f"Count #{idx + 1}: {count['actual_quantity']:.0f} @ {count['zone_name']}{'-' + count['rack_name'] if count['rack_name'] else ''}{'-' + count['bin_name'] if count['bin_name'] else ''}"):
-                    col1, col2, col3 = st.columns([2, 2, 1])
-                    
-                    with col1:
-                        st.write(f"**Batch:** {count.get('batch_no', 'N/A')}")
-                        st.write(f"**Time:** {count['time']}")
-                    
-                    with col2:
-                        if count.get('actual_notes'):
-                            st.write(f"**Notes:** {count['actual_notes']}")
-                        
-                        # Show attachments if any
-                        if idx in st.session_state.count_attachments:
-                            attachments = st.session_state.count_attachments[idx]
-                            st.write(f"**📎 Attachments:** {len(attachments)}")
-                            for att in attachments:
-                                st.caption(f"• {att['file'].name} ({att['file'].size / 1024:.1f}KB)")
-                    
-                    with col3:
-                        if st.button("❌ Remove", key=f"del_{idx}"):
-                            st.session_state.temp_counts.pop(idx)
-                            if idx in st.session_state.count_attachments:
-                                del st.session_state.count_attachments[idx]
-                            st.session_state.last_action = "🗑️ Removed count"
-                            st.session_state.last_action_time = datetime.now()
-                            st.rerun()
+# ============== ITEM MANAGEMENT FUNCTIONS ==============
 
-# ============== MAIN COUNTING INTERFACE ==============
-
-@st.fragment(run_every=None)
-def counting_form_fragment():
-    """Isolated counting form with media upload"""
+def add_new_item(item_data: Dict):
+    """Add item to list with validation"""
+    # Validate required fields
+    if not item_data.get('product_name'):
+        raise ValueError("Product name is required")
     
-    if not st.session_state.selected_product:
-        st.info("👆 Please select a product above")
-        return
+    if item_data.get('actual_quantity', 0) <= 0:
+        raise ValueError("Quantity must be greater than 0")
     
-    # Product info display
-    col1, col2 = st.columns([3, 1])
+    # Handle date conversion
+    if item_data.get('expired_date') and hasattr(item_data['expired_date'], 'isoformat'):
+        item_data['expired_date'] = item_data['expired_date'].isoformat()
+    
+    # Add metadata
+    item_data['temp_id'] = f"new_{st.session_state.item_counter}_{int(time.time() * 1000)}"
+    item_data['added_time'] = datetime.now()
+    
+    # Add to list
+    st.session_state.new_items_list.append(item_data)
+    st.session_state.item_counter += 1
+    
+    # Store attachments if any
+    if st.session_state.pending_attachments:
+        st.session_state.item_attachments[item_data['temp_id']] = st.session_state.pending_attachments.copy()
+        st.session_state.pending_attachments = []
+    
+    return item_data['temp_id']
+
+def remove_item(temp_id: str):
+    """Remove item from list"""
+    st.session_state.new_items_list = [
+        item for item in st.session_state.new_items_list 
+        if item.get('temp_id') != temp_id
+    ]
+    # Remove attachments
+    if temp_id in st.session_state.item_attachments:
+        del st.session_state.item_attachments[temp_id]
+
+def clear_all_items():
+    """Clear all items from list"""
+    st.session_state.new_items_list = []
+    st.session_state.item_counter = 0
+    st.session_state.item_attachments = {}
+    st.session_state.pending_attachments = []
+    # Clear team count cache
+    get_team_physical_count_summary.clear()
+    get_team_physical_counts_detail.clear()
+    get_team_top_products.clear()
+    get_team_physical_count_for_product.clear()
+
+def get_items_summary() -> Dict:
+    """Get summary statistics for current user's pending physical items"""
+    if not st.session_state.new_items_list:
+        return {
+            'total_items': 0,
+            'total_quantity': 0,
+            'unique_products': 0,
+            'total_batches': 0,
+            'items_in_erp': 0,
+            'items_not_in_erp': 0,
+            'total_attachments': 0
+        }
+    
+    total_quantity = sum(item.get('actual_quantity', 0) for item in st.session_state.new_items_list)
+    unique_products = len(set(item.get('product_name', '').upper() for item in st.session_state.new_items_list))
+    total_batches = len(set((item.get('product_name', ''), item.get('batch_no', '')) 
+                           for item in st.session_state.new_items_list))
+    
+    # Count by whether product exists in ERP
+    items_in_erp = sum(1 for item in st.session_state.new_items_list 
+                       if item.get('product_id') is not None)
+    items_not_in_erp = len(st.session_state.new_items_list) - items_in_erp
+    
+    # Count attachments
+    total_attachments = sum(len(attachments) for attachments in st.session_state.item_attachments.values())
+    
+    return {
+        'total_items': len(st.session_state.new_items_list),
+        'total_quantity': total_quantity,
+        'unique_products': unique_products,
+        'total_batches': total_batches,
+        'items_in_erp': items_in_erp,
+        'items_not_in_erp': items_not_in_erp,
+        'total_attachments': total_attachments
+    }
+
+def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
+    """Save all physical items and attachments to database"""
+    if not st.session_state.new_items_list:
+        return 0, ["No items to save"]
+    
+    # Get transaction code for S3 organization
+    tx_info = audit_service.get_transaction_info(transaction_id)
+    transaction_code = tx_info.get('transaction_code', f'TXN_{transaction_id}')
+    
+    # Prepare count data list
+    count_list = []
+    for item in st.session_state.new_items_list:
+        # Handle expired_date conversion
+        expired_date = item.get('expired_date')
+        if expired_date:
+            try:
+                if isinstance(expired_date, str):
+                    expired_date = datetime.fromisoformat(expired_date).date()
+            except:
+                logger.warning(f"Failed to parse expiry date: {expired_date}")
+                expired_date = None
+        
+        # Create appropriate notes based on whether product exists in ERP
+        if item.get('product_id'):
+            # Physical item that exists in ERP product master
+            actual_notes = f"PHYSICAL COUNT - IN ERP: {item.get('reference_pt_code', '')} - {item.get('product_name', '')} - {item.get('notes', '')}"
+        else:
+            # Physical item NOT in ERP product master
+            actual_notes = f"PHYSICAL COUNT - NOT IN ERP: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}"
+        
+        count_data = {
+            'transaction_id': transaction_id,
+            'product_id': item.get('product_id'),  # Will be actual ID or None
+            'batch_no': item.get('batch_no', ''),
+            'expired_date': expired_date,
+            'zone_name': item.get('zone_name', ''),
+            'rack_name': item.get('rack_name', ''),
+            'bin_name': item.get('bin_name', ''),
+            'location_notes': item.get('location_notes', ''),
+            'system_quantity': 0,  # Always 0 for physical count items not in ERP inventory
+            'system_value_usd': 0,  # Always 0 for physical count items not in ERP inventory
+            'actual_quantity': item.get('actual_quantity', 0),
+            'actual_notes': actual_notes,
+            'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
+            'created_by_user_id': st.session_state.user_id
+        }
+        count_list.append(count_data)
+    
+    # Save all counts at once and get IDs
+    saved_ids, errors = audit_service.save_batch_counts(count_list)
+    
+    # Upload attachments for successful saves
+    for item, count_id in zip(st.session_state.new_items_list, saved_ids):
+        if count_id:  # Successfully saved
+            temp_id = item.get('temp_id')
+            if temp_id and temp_id in st.session_state.item_attachments:
+                attachments = st.session_state.item_attachments[temp_id]
+                # count_id is the entity_id for entity_type='count_detail'
+                upload_count_attachments(count_id, attachments, transaction_code)
+    
+    # Count successes
+    successful_saves = len([id for id in saved_ids if id is not None])
+    
+    if successful_saves > 0:
+        st.session_state.last_save_time = datetime.now()
+        clear_all_items()
+        # Clear caches to refresh team data
+        get_team_physical_count_summary.clear()
+        get_team_physical_counts_detail.clear()
+        get_team_top_products.clear()
+        get_team_physical_count_for_product.clear()
+    
+    return successful_saves, errors
+
+# ============== UI COMPONENTS ==============
+
+def show_header():
+    """Display header with user info"""
+    col1, col2, col3 = st.columns([6, 2, 2])
+    
     with col1:
-        st.markdown(f"**{st.session_state.selected_product['product_name']}**")
-        st.caption(f"PT Code: {st.session_state.selected_product.get('pt_code', 'N/A')}")
+        st.title("📦 Warehouse Physical Count - Items NOT in ERP Inventory")
+        st.caption("Record physical items found in warehouse that are not in ERP inventory data")
+    
     with col2:
-        st.metric("System Total", f"{st.session_state.selected_product.get('total_quantity', 0):.0f}")
+        st.metric("User", auth.get_user_display_name())
+    
+    with col3:
+        if st.button("🚪 Logout", use_container_width=True):
+            auth.logout()
+            st.rerun()
+
+def show_summary_bar():
+    """Display summary statistics bar with team data and attachments"""
+    # Get current user summary
+    user_summary = get_items_summary()
+    
+    # Get team summary if we have a session
+    team_summary = None
+    if 'selected_session_id' in st.session_state:
+        team_summary = get_team_physical_count_summary(st.session_state.selected_session_id)
+    
+    col1, col2, col3 = st.columns([4, 4, 4])
+    
+    with col1:
+        st.markdown("### 📋 Your Pending Items")
+        if user_summary['total_items'] > 0:
+            subcol1, subcol2, subcol3, subcol4 = st.columns(4)
+            with subcol1:
+                st.metric("Items", user_summary['total_items'])
+            with subcol2:
+                st.metric("Quantity", f"{user_summary['total_quantity']:.0f}")
+            with subcol3:
+                st.metric("Products", user_summary['unique_products'])
+            with subcol4:
+                st.metric("📎", user_summary['total_attachments'])
+        else:
+            st.info("No pending items")
+    
+    with col2:
+        st.markdown("### 👥 Team Total (All Saved)")
+        if team_summary and team_summary.get('total_items', 0) > 0:
+            subcol1, subcol2, subcol3 = st.columns(3)
+            with subcol1:
+                st.metric("Items", team_summary['total_items'])
+            with subcol2:
+                st.metric("Quantity", f"{team_summary['total_quantity']:.0f}")
+            with subcol3:
+                st.metric("Users", team_summary['total_users'])
+        else:
+            st.info("No team counts yet")
+    
+    with col3:
+        st.markdown("### 🎯 Actions")
+        if user_summary['total_items'] > 0:
+            col_save, col_clear = st.columns(2)
+            with col_save:
+                if st.button("💾 Save All", use_container_width=True, type="primary"):
+                    st.session_state.trigger_save = True
+            with col_clear:
+                if st.button("🗑️ Clear", use_container_width=True):
+                    st.session_state.show_clear_confirm = True
+        
+        # Team view button
+        if team_summary and team_summary.get('total_items', 0) > 0:
+            if st.button(
+                f"👥 View All Team Counts ({team_summary['total_users']} users, {team_summary['total_items']} items)",
+                use_container_width=True,
+                key="toggle_team_view"
+            ):
+                st.session_state.show_team_counts = not st.session_state.show_team_counts
     
     st.markdown("---")
+
+def show_transaction_selector():
+    """Show transaction selector"""
+    st.markdown("### 📋 Select Transaction")
     
-    # Form inputs with media upload
-    with st.form("counting_form", clear_on_submit=False):
+    # Get user's draft transactions
+    if 'selected_session_id' not in st.session_state:
+        sessions = audit_service.get_sessions_by_status('in_progress')
+        if sessions:
+            st.session_state.selected_session_id = sessions[0]['id']
+    
+    if 'selected_session_id' in st.session_state:
+        transactions = audit_service.get_user_transactions(
+            st.session_state.selected_session_id,
+            st.session_state.user_id,
+            status='draft'
+        )
+        
+        if transactions:
+            tx_options = {
+                f"{tx['transaction_name']} ({tx['transaction_code']})": tx
+                for tx in transactions
+            }
+            
+            selected_key = st.selectbox(
+                "Select your draft transaction:",
+                options=list(tx_options.keys()),
+                help="Select the transaction to add new items to"
+            )
+            
+            selected_tx = tx_options[selected_key]
+            st.session_state.selected_tx_id = selected_tx['id']
+            
+            # Show transaction info
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.info(f"🏢 Warehouse: {selected_tx.get('warehouse_name', 'N/A')}")
+            with col2:
+                st.info(f"🏷️ Zones: {selected_tx.get('assigned_zones', 'All')}")
+            with col3:
+                st.info(f"📦 Items Counted: {selected_tx.get('total_items_counted', 0)}")
+            
+            return selected_tx['id']
+        else:
+            st.warning("⚠️ No draft transactions available. Please create one first.")
+            return None
+    else:
+        st.warning("⚠️ No active session found. Please select a session.")
+        return None
+
+def show_entry_form():
+    """Show simplified entry form with media upload"""
+    st.markdown("### ✏️ Add Physical Item")
+    
+    # Initialize form key if not exists
+    if 'form_key' not in st.session_state:
+        st.session_state.form_key = 0
+    
+    # Load all products once
+    all_products = get_all_products()
+    
+    # PRODUCT SELECTOR OUTSIDE FORM
+    st.markdown("**Product (if exists in ERP)**")
+    
+    # Create options for selectbox with ALL products
+    product_options = {"-- Not in ERP / New Product --": None}
+    
+    # Add all products to options
+    for p in all_products:
+        display_name = f"{p['pt_code']} - {p['product_name']}"
+        if p.get('brand_name'):
+            display_name += f" | {p['brand_name']}"
+        if p.get('package_size'):
+            display_name += f" ({p['package_size']})"
+        # Add Product ID at the end
+        display_name += f" |ID: {p['id']}"
+        product_options[display_name] = p
+    
+    # Store selected product in session state
+    if 'selected_product_key' not in st.session_state:
+        st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+    
+    # Product selector OUTSIDE form
+    selected_product_key = st.selectbox(
+        "Select Product",
+        options=list(product_options.keys()),
+        key=f"product_selector_widget_{st.session_state.form_key}",
+        help="Type to search in the dropdown. Select 'Not in ERP' if product doesn't exist",
+        index=0 if st.session_state.selected_product_key == "-- Not in ERP / New Product --" 
+               else list(product_options.keys()).index(st.session_state.selected_product_key)
+    )
+    
+    # Update session state
+    st.session_state.selected_product_key = selected_product_key
+    selected_product = product_options.get(selected_product_key)
+    
+    # Show selected product info and team count check
+    if selected_product:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.success(f"✅ ERP Product Selected: {selected_product['pt_code']} - {selected_product['product_name']} (ID: {selected_product['id']})")
+        
+        # Check if team has already counted this product
+        if 'selected_session_id' in st.session_state:
+            team_product_count = get_team_physical_count_for_product(
+                st.session_state.selected_session_id,
+                selected_product['id']
+            )
+            
+            if team_product_count:
+                with col2:
+                    st.warning(f"⚠️ Already counted by team: {team_product_count['total_quantity']:.0f} units")
+                
+                # Show detailed team count info
+                with st.expander(f"👥 View Team Counts ({team_product_count['total_users']} users, {team_product_count['total_records']} records)", expanded=False):
+                    col_info1, col_info2, col_info3 = st.columns(3)
+                    with col_info1:
+                        st.metric("Total Quantity", f"{team_product_count['total_quantity']:.0f}")
+                    with col_info2:
+                        st.metric("Total Records", team_product_count['total_records'])
+                    with col_info3:
+                        st.metric("Users", team_product_count['total_users'])
+                    
+                    st.markdown("**Counted by:**")
+                    for user in team_product_count['users_list']:
+                        st.caption(f"• {user}")
+                    
+                    st.markdown("**In transactions:**")
+                    for tx_code in team_product_count['transaction_codes']:
+                        st.caption(f"• {tx_code}")
+                    
+                    if team_product_count['last_counted']:
+                        st.caption(f"Last counted: {pd.to_datetime(team_product_count['last_counted']).strftime('%Y-%m-%d %H:%M')}")
+            else:
+                with col2:
+                    st.info("ℹ️ Not yet counted by team")
+    else:
+        st.info("ℹ️ Product not in ERP - Enter details manually below")
+    
+    # Main form with dynamic key for reset
+    with st.form(f"new_item_form_{st.session_state.form_key}", clear_on_submit=True):
+        # Form fields
         col1, col2 = st.columns(2)
         
         with col1:
-            batch_no = st.text_input(
-                "Batch Number",
-                key="batch_input_form",
-                value=st.session_state.form_batch_no,
-                placeholder="Enter batch or select from dropdown"
-            )
+            # Product ID - only show if product selected
+            if selected_product:
+                product_id_display = st.text_input(
+                    "Product ID", 
+                    value=str(selected_product.get('id', '')),
+                    disabled=True,
+                    help="Auto-filled from ERP"
+                )
             
-            expiry = st.date_input(
-                "Expiry Date",
-                key="expiry_input_form",
-                value=st.session_state.form_expiry,
-                min_value=date(2020, 1, 1),
-                max_value=date(2030, 12, 31)
-            )
+            # Product name - auto-filled or manual entry
+            if selected_product:
+                product_name = st.text_input(
+                    "Product Name*", 
+                    value=selected_product.get('product_name', ''),
+                    disabled=True
+                )
+                actual_product_name = selected_product.get('product_name', '')
+            else:
+                product_name = st.text_input(
+                    "Product Name*", 
+                    placeholder="Enter product name"
+                )
+                actual_product_name = product_name
             
-            qty = st.number_input(
-                "Actual Quantity*",
-                min_value=0.0,
-                step=1.0,
-                key="qty_input_form",
-                format="%.2f"
-            )
+            # Brand - auto-filled or manual entry
+            if selected_product:
+                brand_name = st.text_input(
+                    "Brand", 
+                    value=selected_product.get('brand_name', ''),
+                    disabled=True
+                )
+                actual_brand = selected_product.get('brand_name', '')
+            else:
+                brand_name = st.text_input(
+                    "Brand", 
+                    placeholder="Enter brand name"
+                )
+                actual_brand = brand_name
+            
+            batch_no = st.text_input("Batch Number", placeholder="Enter batch number")
+            
+            # Package size
+            if selected_product:
+                package_size = st.text_input(
+                    "Package Size", 
+                    value=selected_product.get('package_size', ''),
+                    disabled=True
+                )
+                actual_package_size = selected_product.get('package_size', '')
+            else:
+                package_size = st.text_input(
+                    "Package Size", 
+                    placeholder="e.g., 100 tablets, 500ml"
+                )
+                actual_package_size = package_size
         
         with col2:
-            location = st.text_input(
-                "Location",
-                key="loc_input_form",
-                value=st.session_state.form_location,
-                placeholder="e.g., A1-R01-B01"
+            quantity = st.number_input(
+                "Quantity*", 
+                min_value=0.0, 
+                value=0.0,  # Default value
+                step=1.0, 
+                format="%.2f",
+                help="Physical quantity found in warehouse"
             )
             
-            notes = st.text_area(
-                "Notes",
-                key="notes_input_form",
-                height=100,
-                placeholder="Any observations"
+            expired_date = st.date_input(
+                "Expiry Date", 
+                value=None,
+                help="Leave empty if no expiry date"
             )
+            
+            # Location inputs with default values
+            st.markdown("**Location**")
+            col_z, col_r, col_b = st.columns(3)
+            with col_z:
+                zone = st.text_input("Zone", value=st.session_state.default_location.get('zone', ''))
+            with col_r:
+                rack = st.text_input("Rack", value=st.session_state.default_location.get('rack', ''))
+            with col_b:
+                bin_name = st.text_input("Bin", value=st.session_state.default_location.get('bin', ''))
+        
+        notes = st.text_area(
+            "Additional Notes", 
+            placeholder="Any observations, damage, special conditions, etc."
+        )
         
         # Media upload section
         st.markdown("### 📎 Attachments (Optional)")
@@ -608,595 +981,192 @@ def counting_form_fragment():
                 "Upload Images/Documents",
                 type=ALLOWED_IMAGE_TYPES + ALLOWED_DOC_TYPES,
                 accept_multiple_files=True,
-                key="file_uploader",
+                key=f"file_uploader_{st.session_state.form_key}",
                 help=f"Max {MAX_FILE_SIZE_MB}MB per file"
             )
         
         with col2:
             attachment_notes = st.text_area(
                 "Attachment Notes",
-                key="attachment_notes",
+                key=f"attachment_notes_{st.session_state.form_key}",
                 placeholder="Describe the attachments (optional)",
                 height=100
             )
         
-        # Form submission
-        submit_col1, submit_col2 = st.columns(2)
+        # Submit buttons
+        col_submit, col_reset = st.columns([3, 1])
         
-        with submit_col1:
-            add_submitted = st.form_submit_button(
-                f"➕ Add Count ({len(st.session_state.temp_counts)}/20)",
+        with col_submit:
+            submitted = st.form_submit_button(
+                "➕ Add Physical Item",
+                use_container_width=True,
                 type="primary",
-                use_container_width=True,
-                disabled=len(st.session_state.temp_counts) >= 20
+                disabled=len(st.session_state.new_items_list) >= 20
             )
         
-        with submit_col2:
-            save_submitted = st.form_submit_button(
-                f"💾 Save All ({len(st.session_state.temp_counts)})",
-                use_container_width=True,
-                disabled=len(st.session_state.temp_counts) == 0
-            )
+        with col_reset:
+            reset = st.form_submit_button("🔄 Reset Form", use_container_width=True)
         
         # Handle form submission
-        if add_submitted:
-            if qty > 0 and st.session_state.selected_product:
-                # Update session state values
-                st.session_state.qty_input = qty
-                st.session_state.batch_input = batch_no
-                st.session_state.loc_input = location
-                st.session_state.notes_input = notes
-                st.session_state.expiry_input = expiry
-                
-                # Process uploaded files
-                if uploaded_files:
-                    st.session_state.pending_attachments = []
-                    for file in uploaded_files:
-                        valid, msg = validate_file(file)
-                        if valid:
-                            st.session_state.pending_attachments.append({
-                                'file': file,
-                                'description': attachment_notes
-                            })
-                        else:
-                            st.warning(f"⚠️ {file.name}: {msg}")
-                
-                # Add count
-                add_count_callback()
-                st.rerun()
+        if submitted:
+            # Initialize actual_product_name if not defined (edge case)
+            if 'actual_product_name' not in locals():
+                actual_product_name = ""
+            
+            if not actual_product_name:
+                st.error("❌ Product name is required!")
+            elif quantity <= 0:
+                st.error("❌ Quantity must be greater than 0!")
+            elif not zone:
+                st.error("❌ Zone is required for location!")
             else:
-                st.warning("⚠️ Please enter a quantity greater than 0")
-        
-        elif save_submitted:
-            save_counts_callback()
-            st.rerun()
-    
-    # Clear all button outside form
-    if st.button("🗑️ Clear All", use_container_width=True):
-        st.session_state.temp_counts = []
-        st.session_state.count_attachments = {}
-        st.session_state.pending_attachments = []
-        st.session_state.last_action = "🗑️ Cleared all pending counts"
-        st.session_state.last_action_time = datetime.now()
-        st.rerun()
-
-def counting_page():
-    """Main counting page with media support"""
-    st.subheader("🚀 Fast Counting Mode")
-    
-    init_session_state()
-    
-    # Check prerequisites
-    if 'selected_session_id' not in st.session_state:
-        st.warning("⚠️ Please select a session in Transactions tab first")
-        return
-    
-    # Get draft transactions
-    try:
-        transactions = audit_service.get_user_transactions(
-            st.session_state.selected_session_id,
-            st.session_state.user_id,
-            status='draft'
-        )
-    except Exception as e:
-        st.error(f"Error loading transactions: {str(e)}")
-        return
-    
-    if not transactions:
-        st.warning("⚠️ No draft transactions available for counting")
-        st.info("Please create a new transaction in the Transactions tab")
-        return
-    
-    # Transaction selector
-    tx_options = {f"{t['transaction_name']} ({t['transaction_code']})": t for t in transactions}
-    selected_tx_key = st.selectbox(
-        "Select Transaction",
-        list(tx_options.keys()),
-        help="Select the transaction you want to count for"
-    )
-    
-    selected_tx = tx_options[selected_tx_key]
-    st.session_state.tx_id = selected_tx['id']
-    warehouse_id = selected_tx['warehouse_id']
-    
-    # Show action status
-    if st.session_state.last_action and st.session_state.last_action_time:
-        time_diff = (datetime.now() - st.session_state.last_action_time).seconds
-        if time_diff < 3:
-            if "✅" in st.session_state.last_action:
-                st.success(st.session_state.last_action)
-            elif "⚠️" in st.session_state.last_action:
-                st.warning(st.session_state.last_action)
-            elif "❌" in st.session_state.last_action:
-                st.error(st.session_state.last_action)
-            else:
-                st.info(st.session_state.last_action)
-    
-    # Display temporary counts
-    render_temp_counts()
-    
-    st.markdown("### 📦 Product Selection")
-    
-    # Initialize loading state
-    if 'products_loaded' not in st.session_state:
-        st.session_state.products_loaded = False
-        st.session_state.current_warehouse_id = None
-    
-    # Check if we need to reload products
-    if (not st.session_state.products_loaded or 
-        st.session_state.current_warehouse_id != warehouse_id):
-        
-        with st.spinner("Loading products..."):
-            try:
-                # Get products
-                products = get_warehouse_products(warehouse_id)
-                
-                # Get team count summaries for ALL products at once (efficient)
-                team_summaries = get_all_products_team_summary(st.session_state.selected_session_id)
-                
-                # Build product options
-                product_options = ["-- Select Product --"]
-                products_map = {}
-                
-                for p in products:
-                    product_id = p['product_id']
-                    system_qty = p.get('total_quantity', 0)
-                    
-                    # Get team count info from pre-loaded summaries
-                    team_summary = team_summaries.get(product_id, {})
-                    team_counted_qty = team_summary.get('grand_total_counted', 0)
-                    team_count_records = team_summary.get('total_count_records', 0)
-                    
-                    # Check temp counts
-                    temp_qty = sum(tc['actual_quantity'] for tc in st.session_state.temp_counts 
-                                   if tc.get('product_id') == product_id)
-                    
-                    # Determine status based on TEAM counted quantity
-                    if temp_qty > 0:
-                        status = "📝"  # Has pending counts
-                    elif team_counted_qty >= system_qty * 0.95 and system_qty > 0:
-                        status = "✅"  # Fully counted (95%+)
-                    elif team_counted_qty > 0:
-                        status = "🟡"  # Partially counted
-                    else:
-                        status = "⭕"  # Not counted
-                    
-                    # Format display
-                    product_name = p.get('product_name', 'Unknown')
-                    package_size = p.get('package_size', 'Unknown')
-                    brand = p.get('brand', 'Unknown')
-
-                    # Cut strings to 40 chars
-                    product_display = product_name[:40] + ("..." if len(product_name) > 40 else "")
-                    package_display = package_size[:40] + ("..." if len(package_size) > 40 else "")
-
-                    display = f"{status} {p.get('pt_code', 'N/A')} - {product_display} || {package_display} ({brand})"
-
-                    if team_counted_qty > 0:
-                        display += f" [{team_count_records} records, {team_counted_qty:.0f}/{system_qty:.0f}]"
-                    else:
-                        display += f" [System: {system_qty:.0f}]"
-                    
-                    product_options.append(display)
-                    products_map[display] = p
-                
-                # Store in session state
-                st.session_state.product_options = product_options
-                st.session_state.products_map = products_map
-                st.session_state.products_loaded = True
-                st.session_state.current_warehouse_id = warehouse_id
-                
-            except Exception as e:
-                st.error(f"Error loading products: {str(e)}")
-                st.session_state.products_loaded = False
-                return
-    
-    # Product selector (use stored options)
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        # Get current selection
-        current_selection = None
-        if st.session_state.selected_product:
-            # Find current product in options
-            for opt in st.session_state.get('product_options', []):
-                if opt in st.session_state.products_map:
-                    prod_data = st.session_state.products_map[opt]
-                    if prod_data.get('product_id') == st.session_state.selected_product.get('product_id'):
-                        current_selection = opt
-                        break
-        
-        selected = st.selectbox(
-            "Select Product",
-            st.session_state.get('product_options', ["-- Select Product --"]),
-            index=st.session_state.get('product_options', ["-- Select Product --"]).index(current_selection) if current_selection else 0,
-            key="product_select",
-            on_change=on_product_change,
-            help="⭕ Not counted | 📝 Has pending counts"
-        )
-    
-    with col2:
-        if st.button("🔄 Refresh", use_container_width=True):
-            # Clear caches and reload flags
-            get_warehouse_products.clear()
-            get_count_summary.clear()
-            get_session_product_summary.clear()
-            get_all_products_team_summary.clear()
-            st.session_state.products_loaded = False
-            st.rerun()
-    
-    # Load team count data separately (after product selection)
-    if st.session_state.selected_product and 'product_id' in st.session_state.selected_product:
-        try:
-            summary = get_session_product_summary(
-                st.session_state.selected_session_id, 
-                st.session_state.selected_product['product_id']
-            )
-            
-            if summary.get('total_count_records', 0) > 0:
-                # Update status display with team counts
-                team_counted_qty = summary.get('grand_total_counted', 0)
-                system_qty = st.session_state.selected_product.get('total_quantity', 0)
-                
-                # Show completion status
-                if team_counted_qty >= system_qty * 0.95:
-                    st.success(f"✅ Product fully counted by team: {team_counted_qty:.0f}/{system_qty:.0f}")
-                elif team_counted_qty > 0:
-                    st.warning(f"🟡 Partially counted by team: {team_counted_qty:.0f}/{system_qty:.0f}")
-                
-                # Team counts button
-                if st.button(
-                    f"👥 View All Team Counts ({summary['total_users']} users, "
-                    f"{summary['total_transactions']} transactions)",
-                    key="toggle_teamwork"
-                ):
-                    st.session_state.show_teamwork_view = not st.session_state.show_teamwork_view
-                
-                # Show teamwork view if toggled
-                if st.session_state.show_teamwork_view:
-                    with st.container():
-                        st.markdown("---")
-                        display_teamwork_counts(
-                            st.session_state.selected_session_id,
-                            st.session_state.selected_product['product_id'],
-                            selected_tx['id']
-                        )
-                        st.markdown("---")
-        except Exception as e:
-            logger.error(f"Error loading team counts: {e}")
-    
-    # Batch selector
-    if st.session_state.selected_product:
-        batches = get_product_batches(warehouse_id, st.session_state.selected_product['product_id'])
-        
-        if batches:
-            st.markdown("### 📦 Batch Selection (Optional)")
-            
-            batch_options = ["-- Manual Entry --"]
-            batches_map = {}
-            
-            today = date.today()
-            
-            for batch in batches:
-                # Check expiry status
-                status = ""
-                if batch.get('expired_date'):
-                    try:
-                        exp_date = pd.to_datetime(batch['expired_date']).date()
-                        if exp_date < today:
-                            status = "🔴 "  # Expired
-                        elif exp_date < today + timedelta(days=90):
-                            status = "🟡 "  # Expiring soon
-                        else:
-                            status = "🟢 "  # Normal
-                    except:
-                        pass
-                
-                # Format option
-                qty_str = f"{batch['quantity']:.0f}"
-                loc_str = batch.get('location', 'N/A')
-                option = f"{status}{batch['batch_no']} (Qty: {qty_str}, Loc: {loc_str})"
-                
-                batch_options.append(option)
-                batches_map[batch['batch_no']] = batch
-            
-            st.session_state.batches_map = batches_map
-            
-            st.selectbox(
-                "Select Batch or Manual Entry",
-                batch_options,
-                key="batch_select",
-                on_change=on_batch_change,
-                help="🔴 Expired | 🟡 Expiring Soon (<90 days) | 🟢 Normal"
-            )
-            
-            st.info("💡 **Multiple Counts Allowed**: You can count the same batch multiple times from different locations")
-        
-        st.markdown("### ✏️ Count Entry")
-    
-    # Counting form with media
-    counting_form_fragment()
-
-# ============== ROLE PERMISSIONS ==============
-
-# Role permissions
-AUDIT_ROLES = {
-    # Executive Level - Full access
-    'admin': ['manage_sessions', 'view_all', 'create_transactions', 'export_data', 'user_management'],
-    'GM': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    'MD': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    
-    # Management Level - Session management + full view
-    'supply_chain': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    'sales_manager': ['manage_sessions', 'view_all', 'create_transactions', 'export_data'],
-    
-    # Operational Level - Can participate in audits
-    'sales': ['create_transactions', 'view_own', 'view_assigned_sessions'],
-    
-    # View Level - Read only
-    'viewer': ['view_own', 'view_assigned_sessions'],
-    
-    # External/Restricted - Limited or no access
-    'customer': [],  # No audit access
-    'vendor': []     # No audit access
-}
-
-def check_permission(action: str) -> bool:
-    """Check if current user has permission for action"""
-    user_role = st.session_state.get('user_role', 'viewer')
-    return action in AUDIT_ROLES.get(user_role, [])
-
-# ============== MAIN APPLICATION ==============
-
-def main():
-    """Main application entry point"""
-    try:
-        if not auth.check_session():
-            show_login_page()
-        else:
-            show_main_app()
-    except Exception as e:
-        st.error(f"Application error: {str(e)}")
-        logger.error(f"Main app error: {e}")
-
-def show_login_page():
-    """Display simple login page"""
-    st.title("📦 Warehouse Audit System")
-    st.markdown("### Please login to access the system")
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        with st.form("login_form"):
-            username = st.text_input("Username", placeholder="Enter your username")
-            password = st.text_input("Password", type="password", placeholder="Enter your password")
-            
-            submit = st.form_submit_button("🔐 Login", use_container_width=True)
-            
-            if submit:
-                if username and password:
-                    try:
-                        success, result = auth.authenticate(username, password)
-                        
-                        if success:
-                            auth.login(result)
-                            st.success("✅ Login successful!")
-                            st.rerun()
-                        else:
-                            st.error("❌ Invalid username or password")
-                    except Exception as e:
-                        logger.error(f"Login error: {e}")
-                        st.error(f"❌ Login error: {str(e)}")
-                else:
-                    st.warning("⚠️ Please enter both username and password")
-
-def show_main_app():
-    """Display main application interface"""
-    init_session_state()
-    
-    # Sidebar with user info
-    with st.sidebar:
-        st.markdown("### 👤 User Info")
-        display_name = st.session_state.get('employee_name') or st.session_state.get('username', 'User')
-        st.write(f"**Name:** {display_name}")
-        st.write(f"**Role:** {st.session_state.get('user_role', 'N/A')}")
-        
-        # Login time
-        login_time = st.session_state.get('login_time')
-        if login_time:
-            st.write(f"**Login:** {login_time.strftime('%H:%M')}")
-        
-        st.markdown("---")
-        
-        if st.button("🚪 Logout", use_container_width=True):
-            auth.logout()
-            st.rerun()
-    
-    # Main content based on role
-    user_role = st.session_state.get('user_role', 'viewer')
-    
-    if not AUDIT_ROLES.get(user_role, []):
-        show_no_access_interface()
-    elif check_permission('create_transactions'):
-        show_audit_interface()
-    else:
-        show_viewer_interface()
-
-def show_no_access_interface():
-    """Interface for users without audit permissions"""
-    st.title("🚫 Access Restricted")
-    st.warning("⚠️ You don't have permission to access the Audit System")
-    st.info("Please contact your administrator for access")
-
-def show_audit_interface():
-    """Main audit interface"""
-    st.title("📦 Warehouse Audit System")
-    
-    tab1, tab2, tab3 = st.tabs(["📄 Transactions", "🚀 Fast Counting", "📸 Media Gallery"])
-    
-    with tab1:
-        show_transactions_page()
-    
-    with tab2:
-        counting_page()
-    
-    with tab3:
-        show_media_gallery()
-
-def show_viewer_interface():
-    """Read-only viewer interface"""
-    st.title("👀 Audit Viewer")
-    st.info("You have read-only access to audit data")
-
-def show_transactions_page():
-    """Transactions management page"""
-    st.subheader("📄 My Audit Transactions")
-    
-    try:
-        # Get active sessions
-        sessions = get_sessions_by_status('in_progress')
-        
-        if not sessions:
-            st.warning("⚠️ No active audit sessions available")
-            st.info("Please wait for an administrator to start an audit session")
-            return
-        
-        # Session selector
-        session_options = {
-            f"{s['session_name']} ({s['session_code']})": s['id'] 
-            for s in sessions
-        }
-        
-        selected_session_key = st.selectbox(
-            "Select Active Session",
-            list(session_options.keys()),
-            help="Select the audit session you want to work on"
-        )
-        
-        selected_session_id = session_options[selected_session_key]
-        st.session_state.selected_session_id = selected_session_id
-        
-        # Create new transaction form
-        with st.expander("➕ Create New Transaction", expanded=False):
-            with st.form("create_transaction"):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    tx_name = st.text_input(
-                        "Transaction Name*",
-                        placeholder="e.g., Zone A1-A3 counting"
-                    )
-                    zones = st.text_input(
-                        "Assigned Zones",
-                        placeholder="e.g., A1,A2,A3"
-                    )
-                
-                with col2:
-                    categories = st.text_input(
-                        "Categories",
-                        placeholder="e.g., Antibiotics, Cold items"
-                    )
-                    notes = st.text_area(
-                        "Notes",
-                        placeholder="Additional notes"
-                    )
-                
-                if st.form_submit_button("Create Transaction", use_container_width=True):
-                    if tx_name:
-                        try:
-                            tx_code = audit_service.create_transaction({
-                                'session_id': selected_session_id,
-                                'transaction_name': tx_name,
-                                'assigned_zones': zones,
-                                'assigned_categories': categories,
-                                'notes': notes,
-                                'created_by_user_id': st.session_state.user_id
-                            })
-                            st.success(f"✅ Transaction created! Code: {tx_code}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Error: {str(e)}")
-                    else:
-                        st.warning("⚠️ Please enter transaction name")
-        
-        # Display user transactions
-        st.markdown("### My Transactions")
-        
-        transactions = audit_service.get_user_transactions(
-            selected_session_id,
-            st.session_state.user_id
-        )
-        
-        if transactions:
-            for tx in transactions:
-                with st.container():
-                    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-                    
-                    with col1:
-                        st.write(f"**{tx['transaction_name']}**")
-                        st.caption(f"Code: {tx['transaction_code']}")
-                    
-                    with col2:
-                        status_color = {
-                            'draft': '🟡',
-                            'completed': '✅'
-                        }
-                        st.write(f"{status_color.get(tx['status'], '⭕')} {tx['status'].title()}")
-                        if tx.get('assigned_zones'):
-                            st.caption(f"Zones: {tx['assigned_zones']}")
-                    
-                    with col3:
-                        st.write(f"Items: {tx.get('total_items_counted', 0)}")
-                        st.caption(f"Created: {pd.to_datetime(tx['created_date']).strftime('%m/%d %H:%M')}")
-                    
-                    with col4:
-                        if tx['status'] == 'draft':
-                            if tx.get('total_items_counted', 0) > 0:
-                                if st.button("✅ Submit", key=f"submit_{tx['id']}"):
-                                    try:
-                                        audit_service.submit_transaction(tx['id'], st.session_state.user_id)
-                                        st.success("✅ Transaction submitted!")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"❌ Error: {str(e)}")
+                try:
+                    # Process uploaded files
+                    if uploaded_files:
+                        st.session_state.pending_attachments = []
+                        for file in uploaded_files:
+                            valid, msg = validate_file(file)
+                            if valid:
+                                st.session_state.pending_attachments.append({
+                                    'file': file,
+                                    'description': attachment_notes
+                                })
                             else:
-                                st.caption("No counts yet")
-                        else:
-                            st.caption("Completed ✅")
+                                st.warning(f"⚠️ {file.name}: {msg}")
                     
-                    st.markdown("---")
-        else:
-            st.info("No transactions created yet")
-            
-    except Exception as e:
-        st.error(f"Error loading transactions: {str(e)}")
-        logger.error(f"Transactions page error: {e}")
+                    # Prepare item data
+                    if selected_product:
+                        # Product exists in ERP master data
+                        product_id = selected_product['id']
+                        notes_prefix = f"IN ERP: {selected_product['pt_code']} - "
+                    else:
+                        # Product not in ERP master data
+                        product_id = None
+                        notes_prefix = f"NOT IN ERP: "
+                    
+                    item_data = {
+                        'product_name': actual_product_name,
+                        'brand': actual_brand if 'actual_brand' in locals() else '',
+                        'batch_no': batch_no,
+                        'package_size': actual_package_size if 'actual_package_size' in locals() else '',
+                        'actual_quantity': quantity,
+                        'expired_date': expired_date,
+                        'zone_name': zone,
+                        'rack_name': rack,
+                        'bin_name': bin_name,
+                        'notes': notes_prefix + notes if notes else notes_prefix + "Physical count",
+                        'product_id': product_id,
+                        'is_new_item': True,  # Always TRUE - all are physical items not in ERP inventory
+                        'reference_pt_code': selected_product['pt_code'] if selected_product else None,
+                        'created_by_user_id': st.session_state.user_id
+                    }
+                    
+                    add_new_item(item_data)
+                    
+                    # Success message
+                    attachment_count = len(st.session_state.pending_attachments) if hasattr(st.session_state, 'pending_attachments') else 0
+                    if product_id:
+                        st.success(f"✅ Added: {selected_product['pt_code']} - {actual_product_name} (ID: {product_id}, Qty: {quantity}, 📎 {attachment_count})")
+                    else:
+                        st.success(f"✅ Added: {actual_product_name} - NOT IN ERP (Qty: {quantity}, 📎 {attachment_count})")
+                    
+                    # Update default location for next entry
+                    st.session_state.default_location = {'zone': zone, 'rack': rack, 'bin': bin_name}
+                    
+                    # Reset product selector to default
+                    st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+                    
+                    # Clear cache to refresh team counts
+                    get_team_physical_count_for_product.clear()
+                    
+                    # Increment form key to force form reset
+                    st.session_state.form_key += 1
+                    
+                    # Short delay then rerun to clear form
+                    time.sleep(0.5)
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+        
+        if reset:
+            # Reset product selector and form
+            st.session_state.selected_product_key = "-- Not in ERP / New Product --"
+            st.session_state.pending_attachments = []
+            st.session_state.form_key += 1
+            st.rerun()
+
+def show_items_preview():
+    """Display preview of pending items with attachments"""
+    if not st.session_state.new_items_list:
+        return
+    
+    st.markdown("### 📋 Pending Items")
+    
+    # Display as a table with attachment indicator
+    items_data = []
+    for item in st.session_state.new_items_list:
+        temp_id = item.get('temp_id')
+        attachment_count = len(st.session_state.item_attachments.get(temp_id, []))
+        
+        items_data.append({
+            'Type': '📦 ERP' if item.get('product_id') else '❓ New',
+            'ID': item.get('product_id', '-'),
+            'Product': item.get('product_name', ''),
+            'PT Code': item.get('reference_pt_code', '-'),
+            'Brand': item.get('brand', '-'),
+            'Batch': item.get('batch_no', '-'),
+            'Quantity': f"{item.get('actual_quantity', 0):.0f}",
+            'Location': f"{item.get('zone_name', '')}-{item.get('rack_name', '')}-{item.get('bin_name', '')}",
+            '📎': attachment_count if attachment_count > 0 else '-',
+            'temp_id': temp_id
+        })
+    
+    # Create DataFrame
+    df = pd.DataFrame(items_data)
+    
+    # Display with action column
+    for idx, row in df.iterrows():
+        col1, col2, col3, col4, col5, col6, col7, col8, col9, col10 = st.columns([1, 1, 3, 2, 2, 2, 2, 2, 1, 1])
+        
+        with col1:
+            st.write(row['Type'])
+        with col2:
+            st.write(row['ID'])
+        with col3:
+            st.write(row['Product'])
+        with col4:
+            st.write(row['PT Code'])
+        with col5:
+            st.write(row['Brand'])
+        with col6:
+            st.write(row['Batch'])
+        with col7:
+            st.write(row['Quantity'])
+        with col8:
+            st.write(row['Location'])
+        with col9:
+            st.write(str(row['📎']))
+        with col10:
+            if st.button("🗑️", key=f"del_{row['temp_id']}", help="Remove"):
+                remove_item(row['temp_id'])
+                st.rerun()
+        
+        # Show attachments if expanded
+        if row['📎'] != '-':
+            with st.expander(f"View {row['📎']} attachments", expanded=False):
+                attachments = st.session_state.item_attachments.get(row['temp_id'], [])
+                display_attachment_preview(attachments)
+        
+        if idx < len(df) - 1:
+            st.divider()
 
 def show_media_gallery():
-    """Display media gallery for current session"""
-    st.subheader("📸 Media Gallery")
+    """Display media gallery for physical count items"""
+    st.subheader("📸 Media Gallery - Physical Count")
     
     if 'selected_session_id' not in st.session_state:
-        st.warning("⚠️ Please select a session in Transactions tab first")
+        st.warning("⚠️ Please select a session first")
         return
     
     # Get session info
@@ -1232,17 +1202,29 @@ def show_media_gallery():
         if st.button("🔄 Refresh Gallery", use_container_width=True):
             st.rerun()
     
-    # Get attachments based on filters
+    # Get attachments for physical count items
     try:
-        # For now, show attachments from all user's transactions
         all_attachments = []
         
         for tx in user_transactions:
             if tx_filter != "All" and tx['transaction_code'] not in tx_filter:
                 continue
             
-            # Get counts for this transaction
-            counts = audit_service.get_recent_counts(tx['id'], limit=100)
+            # Get physical counts for this transaction
+            query = """
+            SELECT acd.*, p.name as product_name, p.pt_code
+            FROM audit_count_details acd
+            LEFT JOIN products p ON acd.product_id = p.id
+            WHERE acd.transaction_id = :transaction_id
+            AND acd.is_new_item = 1
+            AND acd.delete_flag = 0
+            ORDER BY acd.counted_date DESC
+            """
+            
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                result = conn.execute(text(query), {"transaction_id": tx['id']})
+                counts = [dict(row._mapping) for row in result.fetchall()]
             
             for count in counts:
                 # Get attachments for each count
@@ -1257,9 +1239,11 @@ def show_media_gallery():
                     
                     # Add metadata
                     att['transaction_name'] = tx['transaction_name']
-                    att['product_name'] = count.get('product_name', 'Unknown')
+                    att['product_name'] = count.get('product_name') or 'Not in ERP'
+                    att['pt_code'] = count.get('pt_code', 'N/A')
                     att['batch_no'] = count.get('batch_no', 'N/A')
                     att['counted_date'] = count.get('counted_date')
+                    att['location'] = f"{count.get('zone_name', '')}-{count.get('rack_name', '')}-{count.get('bin_name', '')}"
                     
                     # Generate presigned URL
                     att['s3_url'] = s3_manager.get_presigned_url(att['s3_key'], expiration=3600)
@@ -1274,8 +1258,13 @@ def show_media_gallery():
             for idx, att in enumerate(all_attachments):
                 with cols[idx % 3]:
                     with st.container():
-                        st.markdown(f"**{att['product_name']}**")
-                        st.caption(f"Batch: {att['batch_no']} | {att['transaction_name']}")
+                        if att['pt_code'] != 'N/A':
+                            st.markdown(f"**📦 {att['pt_code']} - {att['product_name']}**")
+                        else:
+                            st.markdown(f"**❓ {att['product_name']}**")
+                        
+                        st.caption(f"Batch: {att['batch_no']} | Loc: {att['location']}")
+                        st.caption(f"Transaction: {att['transaction_name']}")
                         
                         if att['file_type'] == 'image' and att['s3_url']:
                             st.image(att['s3_url'], use_column_width=True)
@@ -1293,11 +1282,314 @@ def show_media_gallery():
                         
                         st.markdown("---")
         else:
-            st.info("No media attachments found for the selected filters")
+            st.info("No media attachments found for physical count items")
             
     except Exception as e:
         st.error(f"Error loading media gallery: {str(e)}")
         logger.error(f"Media gallery error: {e}")
+
+def export_items_to_csv():
+    """Export items to CSV"""
+    if not st.session_state.new_items_list:
+        return
+    
+    # Create DataFrame
+    df_data = []
+    for item in st.session_state.new_items_list:
+        expiry_date = item.get('expired_date', '')
+        if expiry_date:
+            try:
+                if isinstance(expiry_date, str) and expiry_date != '':
+                    expiry_date = datetime.fromisoformat(expiry_date).strftime('%Y-%m-%d')
+            except:
+                pass
+        
+        temp_id = item.get('temp_id')
+        attachment_count = len(st.session_state.item_attachments.get(temp_id, []))
+        
+        df_data.append({
+            'ERP Status': 'In ERP Master' if item.get('product_id') else 'Not in ERP',
+            'Product ID': item.get('product_id', ''),
+            'Product Name': item.get('product_name', ''),
+            'PT Code': item.get('reference_pt_code', ''),
+            'Brand': item.get('brand', ''),
+            'Batch Number': item.get('batch_no', ''),
+            'Package Size': item.get('package_size', ''),
+            'Quantity': item.get('actual_quantity', 0),
+            'Expiry Date': expiry_date,
+            'Zone': item.get('zone_name', ''),
+            'Rack': item.get('rack_name', ''),
+            'Bin': item.get('bin_name', ''),
+            'Notes': item.get('notes', ''),
+            'Attachments': attachment_count,
+            'Added Time': item.get('added_time', '').strftime('%Y-%m-%d %H:%M:%S') if item.get('added_time') else ''
+        })
+    
+    df = pd.DataFrame(df_data)
+    csv = df.to_csv(index=False)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    st.download_button(
+        label="📥 Download CSV",
+        data=csv,
+        file_name=f"warehouse_physical_items_{timestamp}.csv",
+        mime="text/csv"
+    )
+
+def handle_save_action(transaction_id: int):
+    """Handle save action with progress"""
+    if 'trigger_save' in st.session_state and st.session_state.trigger_save:
+        st.session_state.trigger_save = False
+        
+        with st.spinner(f"Saving {len(st.session_state.new_items_list)} items and uploading attachments..."):
+            progress_bar = st.progress(0)
+            
+            # Simulate progress
+            for i in range(50):
+                progress_bar.progress(i / 100)
+                time.sleep(0.01)
+            
+            # Save to database
+            saved_count, errors = save_items_to_db(transaction_id)
+            
+            progress_bar.progress(100)
+            time.sleep(0.5)
+            
+            if errors and saved_count == 0:
+                st.error(f"❌ Failed to save items")
+                for error in errors[:3]:
+                    st.caption(f"• {error}")
+            elif errors and saved_count > 0:
+                st.warning(f"⚠️ Saved {saved_count} items with {len(errors)} errors")
+                for error in errors[:3]:  # Show first 3 errors
+                    st.caption(f"• {error}")
+            else:
+                st.success(f"✅ Successfully saved {saved_count} items with attachments!")
+                st.balloons()
+                time.sleep(1)
+                st.rerun()
+
+def handle_clear_confirmation():
+    """Handle clear all confirmation"""
+    if 'show_clear_confirm' in st.session_state and st.session_state.show_clear_confirm:
+        st.session_state.show_clear_confirm = False
+        
+        with st.container():
+            st.warning("⚠️ Are you sure you want to clear all pending items?")
+            col1, col2, col3 = st.columns([1, 1, 3])
+            
+            with col1:
+                if st.button("✅ Yes, Clear All", type="primary"):
+                    clear_all_items()
+                    st.success("✅ All items cleared!")
+                    time.sleep(0.5)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancel"):
+                    st.rerun()
+
+def show_statistics():
+    """Show team statistics and analytics"""
+    st.markdown("### 📊 Team Statistics")
+    
+    if 'selected_session_id' not in st.session_state:
+        st.info("Select a session to view team statistics")
+        return
+    
+    # Get team summary
+    team_summary = get_team_physical_count_summary(st.session_state.selected_session_id)
+    
+    if not team_summary or team_summary.get('total_items', 0) == 0:
+        st.info("No team data available yet")
+        return
+    
+    # Main metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Items", team_summary['total_items'])
+    
+    with col2:
+        st.metric("Total Quantity", f"{team_summary['total_quantity']:.0f}")
+    
+    with col3:
+        st.metric("Unique Users", team_summary['total_users'])
+    
+    with col4:
+        st.metric("Transactions", team_summary['total_transactions'])
+    
+    # Breakdown by type
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("📦 Items in ERP Master", team_summary['products_in_erp'], 
+                  help="Physical items that exist in ERP product master")
+    
+    with col2:
+        st.metric("❓ Items NOT in ERP", team_summary['products_not_in_erp'],
+                  help="Physical items not found in ERP product master")
+    
+    with col3:
+        st.metric("🎯 Unique ERP Products", team_summary['unique_erp_products'])
+    
+    # Time range
+    if team_summary.get('first_counted') and team_summary.get('last_counted'):
+        st.caption(f"📅 Count period: {pd.to_datetime(team_summary['first_counted']).strftime('%Y-%m-%d %H:%M')} - {pd.to_datetime(team_summary['last_counted']).strftime('%Y-%m-%d %H:%M')}")
+    
+    # Top products chart
+    st.markdown("#### 📈 Top Products by Quantity (Team)")
+    
+    top_products = get_team_top_products(st.session_state.selected_session_id)
+    
+    if top_products:
+        # Create DataFrame for visualization
+        df_top = pd.DataFrame(top_products)
+        df_top['Product'] = df_top.apply(lambda x: f"{x['pt_code']} - {x['product_name'][:30]}..." 
+                                         if len(x['product_name']) > 30 
+                                         else f"{x['pt_code']} - {x['product_name']}", axis=1)
+        
+        # Bar chart
+        st.bar_chart(df_top.set_index('Product')['total_quantity'])
+        
+        # Details table
+        st.markdown("##### Product Details")
+        for _, product in df_top.iterrows():
+            col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+            with col1:
+                st.write(product['Product'])
+            with col2:
+                st.metric("Quantity", f"{product['total_quantity']:.0f}")
+            with col3:
+                st.metric("Records", product['count_records'])
+            with col4:
+                st.metric("Users", product['unique_users'])
+
+# ============== MAIN APPLICATION ==============
+
+def main():
+    """Main application entry for warehouse physical count"""
+    init_session_state()
+    
+    # Check authentication
+    if not auth.check_session():
+        show_login_page()
+    else:
+        show_main_app()
+
+def show_login_page():
+    """Display login page"""
+    st.title("🔑 Login - Warehouse Physical Count")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        with st.form("login_form"):
+            username = st.text_input("Username", placeholder="Enter username")
+            password = st.text_input("Password", type="password", placeholder="Enter password")
+            submit = st.form_submit_button("Login", use_container_width=True)
+            
+            if submit and username and password:
+                success, result = auth.authenticate(username, password)
+                if success:
+                    auth.login(result)
+                    st.success("✅ Login successful!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result.get('error', 'Login failed')}")
+
+def show_main_app():
+    """Main application interface"""
+    # Header
+    show_header()
+    
+    # Summary bar with team data
+    show_summary_bar()
+    
+    # Transaction selector
+    transaction_id = show_transaction_selector()
+    
+    if transaction_id:
+        # Show team counts if toggled
+        if st.session_state.show_team_counts:
+            st.markdown("---")
+            st.markdown("## 👥 All Team Physical Counts")
+            display_team_physical_counts(st.session_state.selected_session_id, transaction_id)
+            st.markdown("---")
+        
+        # Main content in tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📝 Add Items", "📋 Review & Save", "📊 Team Statistics", "📸 Media Gallery"])
+        
+        with tab1:
+            # Entry form
+            show_entry_form()
+            
+            # Show compact preview in sidebar
+            with st.sidebar:
+                st.markdown("### 📦 Quick Preview")
+                summary = get_items_summary()
+                st.metric("Pending Items", summary['total_items'])
+                if summary['total_attachments'] > 0:
+                    st.metric("📎 Attachments", summary['total_attachments'])
+                
+                if st.session_state.new_items_list:
+                    for item in st.session_state.new_items_list[-5:]:  # Show last 5
+                        status = "📦" if item.get('product_id') else "❓"
+                        product_info = f"{item['product_name'][:20]}..."
+                        if item.get('product_id'):
+                            product_info += f" (ID: {item['product_id']})"
+                        
+                        # Check attachments
+                        temp_id = item.get('temp_id')
+                        att_count = len(st.session_state.item_attachments.get(temp_id, []))
+                        if att_count > 0:
+                            product_info += f" 📎{att_count}"
+                        
+                        st.caption(f"{status} {product_info} - Qty: {item['actual_quantity']:.0f}")
+                
+                # Clear cache button
+                st.markdown("---")
+                if st.button("🔄 Clear Cache", help="Clear cached products and reload"):
+                    st.cache_data.clear()
+                    st.success("Cache cleared!")
+                    st.rerun()
+        
+        with tab2:
+            # Items preview
+            show_items_preview()
+            
+            # Export and Save section
+            if st.session_state.new_items_list:
+                st.markdown("---")
+                col1, col2, col3 = st.columns([2, 1, 1])
+                
+                with col1:
+                    summary = get_items_summary()
+                    st.info(f"💡 Ready to save {summary['total_items']} items ({summary['total_attachments']} attachments) to transaction")
+                
+                with col2:
+                    export_items_to_csv()
+                
+                with col3:
+                    if st.button("💾 Save to Database", use_container_width=True, type="primary"):
+                        st.session_state.trigger_save = True
+        
+        with tab3:
+            show_statistics()
+        
+        with tab4:
+            show_media_gallery()
+        
+        # Handle save action
+        handle_save_action(transaction_id)
+        
+        # Handle clear confirmation
+        handle_clear_confirmation()
+    
+    # Footer
+    st.markdown("---")
+    if st.session_state.last_save_time:
+        st.caption(f"Last save: {st.session_state.last_save_time.strftime('%H:%M:%S')}")
 
 if __name__ == "__main__":
     main()
