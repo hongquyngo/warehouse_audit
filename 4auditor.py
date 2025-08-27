@@ -40,7 +40,7 @@ s3_manager = S3Manager()
 # ============== CONSTANTS ==============
 ALLOWED_IMAGE_TYPES = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
 ALLOWED_DOC_TYPES = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt']
-MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_MB = 10
 
 # ============== SIMPLIFIED SESSION STATE ==============
 
@@ -377,30 +377,27 @@ def save_counts_callback():
             tx_info = audit_service.get_transaction_info(st.session_state.tx_id)
             transaction_code = tx_info.get('transaction_code', f'TXN_{st.session_state.tx_id}')
             
-            # Save counts first
-            saved_counts = []
-            errors = []
+            # Save counts and get IDs
+            saved_ids, errors = audit_service.save_batch_counts(st.session_state.temp_counts)
             
-            for idx, count in enumerate(st.session_state.temp_counts):
-                try:
-                    # Save count
-                    count_id = audit_service.save_count_detail(count)
-                    if count_id:
-                        saved_counts.append({'index': idx, 'count_id': count_id})
-                        
-                        # Upload attachments if any
-                        if idx in st.session_state.count_attachments:
-                            attachments = st.session_state.count_attachments[idx]
-                            upload_count_attachments(count_id, attachments, transaction_code)
-                            
-                except Exception as e:
-                    errors.append(f"Count {idx + 1}: {str(e)}")
-                    logger.error(f"Save error for count {idx}: {e}")
+            # Upload attachments for each successfully saved count
+            for idx, (count_data, count_id) in enumerate(zip(st.session_state.temp_counts, saved_ids)):
+                if count_id and idx in st.session_state.count_attachments:
+                    attachments = st.session_state.count_attachments[idx]
+                    # count_id is the entity_id for entity_type='count_detail'
+                    upload_count_attachments(count_id, attachments, transaction_code)
             
-            if errors:
-                st.session_state.last_action = f"⚠️ Saved {len(saved_counts)} counts with {len(errors)} errors"
+            # Count successful saves
+            successful_saves = len([id for id in saved_ids if id is not None])
+            
+            if errors and successful_saves == 0:
+                st.session_state.last_action = f"❌ Failed to save items: {errors[0]}"
+            elif errors:
+                st.session_state.last_action = f"⚠️ Saved {successful_saves} counts with {len(errors)} errors"
+                for error in errors[:3]:  # Show first 3 errors
+                    st.caption(f"• {error}")
             else:
-                st.session_state.last_action = f"✅ Successfully saved {len(saved_counts)} counts!"
+                st.session_state.last_action = f"✅ Successfully saved {successful_saves} counts!"
                 st.session_state.temp_counts = []
                 st.session_state.count_attachments = {}
                 # Clear relevant caches

@@ -596,89 +596,61 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
     tx_info = audit_service.get_transaction_info(transaction_id)
     transaction_code = tx_info.get('transaction_code', f'TXN_{transaction_id}')
     
-    saved_count = 0
-    errors = []
-    
+    # Prepare count data list
+    count_list = []
     for item in st.session_state.new_items_list:
-        try:
-            # Handle expired_date conversion
-            expired_date = item.get('expired_date')
-            if expired_date:
-                try:
-                    if isinstance(expired_date, str):
-                        expired_date = datetime.fromisoformat(expired_date).date()
-                except:
-                    logger.warning(f"Failed to parse expiry date: {expired_date}")
-                    expired_date = None
-            
-            # Create appropriate notes based on whether product exists in ERP
-            if item.get('product_id'):
-                # Physical item that exists in ERP product master
-                actual_notes = f"PHYSICAL COUNT - IN ERP: {item.get('reference_pt_code', '')} - {item.get('product_name', '')} - {item.get('notes', '')}"
-            else:
-                # Physical item NOT in ERP product master
-                actual_notes = f"PHYSICAL COUNT - NOT IN ERP: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}"
-            
-            count_data = {
-                'transaction_id': transaction_id,
-                'product_id': item.get('product_id'),  # Will be actual ID or None
-                'batch_no': item.get('batch_no', ''),
-                'expired_date': expired_date,
-                'zone_name': item.get('zone_name', ''),
-                'rack_name': item.get('rack_name', ''),
-                'bin_name': item.get('bin_name', ''),
-                'location_notes': item.get('location_notes', ''),
-                'system_quantity': 0,  # Always 0 for physical count items not in ERP inventory
-                'system_value_usd': 0,  # Always 0 for physical count items not in ERP inventory
-                'actual_quantity': item.get('actual_quantity', 0),
-                'actual_notes': actual_notes,
-                'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
-                'created_by_user_id': st.session_state.user_id
-            }
-            
-            # Save count
-            count_saved, count_errors = audit_service.save_batch_counts([count_data])
-            
-            if count_saved > 0:
-                saved_count += 1
-                
-                # Get the saved count ID (this is a simplified approach)
-                # In production, you might need a better way to get the actual count ID
-                # For now, we'll use the transaction_id to find the latest count
-                
-                # Upload attachments if any
-                temp_id = item.get('temp_id')
-                if temp_id and temp_id in st.session_state.item_attachments:
-                    # Get the latest count ID for this transaction and product
-                    # This is a workaround - ideally save_batch_counts would return IDs
-                    latest_count_query = """
-                    SELECT id FROM audit_count_details 
-                    WHERE transaction_id = :transaction_id
-                    AND created_by_user_id = :user_id
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """
-                    
-                    engine = get_db_engine()
-                    with engine.connect() as conn:
-                        result = conn.execute(text(latest_count_query), {
-                            'transaction_id': transaction_id,
-                            'user_id': st.session_state.user_id
-                        })
-                        row = result.fetchone()
-                        
-                        if row:
-                            count_id = row.id
-                            attachments = st.session_state.item_attachments[temp_id]
-                            upload_count_attachments(count_id, attachments, transaction_code)
-            else:
-                errors.extend(count_errors)
-                
-        except Exception as e:
-            errors.append(f"Item {item.get('product_name', 'Unknown')}: {str(e)}")
-            logger.error(f"Error saving item: {e}")
+        # Handle expired_date conversion
+        expired_date = item.get('expired_date')
+        if expired_date:
+            try:
+                if isinstance(expired_date, str):
+                    expired_date = datetime.fromisoformat(expired_date).date()
+            except:
+                logger.warning(f"Failed to parse expiry date: {expired_date}")
+                expired_date = None
+        
+        # Create appropriate notes based on whether product exists in ERP
+        if item.get('product_id'):
+            # Physical item that exists in ERP product master
+            actual_notes = f"PHYSICAL COUNT - IN ERP: {item.get('reference_pt_code', '')} - {item.get('product_name', '')} - {item.get('notes', '')}"
+        else:
+            # Physical item NOT in ERP product master
+            actual_notes = f"PHYSICAL COUNT - NOT IN ERP: {item.get('product_name', '')} - {item.get('brand', '')} - {item.get('notes', '')}"
+        
+        count_data = {
+            'transaction_id': transaction_id,
+            'product_id': item.get('product_id'),  # Will be actual ID or None
+            'batch_no': item.get('batch_no', ''),
+            'expired_date': expired_date,
+            'zone_name': item.get('zone_name', ''),
+            'rack_name': item.get('rack_name', ''),
+            'bin_name': item.get('bin_name', ''),
+            'location_notes': item.get('location_notes', ''),
+            'system_quantity': 0,  # Always 0 for physical count items not in ERP inventory
+            'system_value_usd': 0,  # Always 0 for physical count items not in ERP inventory
+            'actual_quantity': item.get('actual_quantity', 0),
+            'actual_notes': actual_notes,
+            'is_new_item': True,  # ALWAYS TRUE - all are physical items not in ERP inventory
+            'created_by_user_id': st.session_state.user_id
+        }
+        count_list.append(count_data)
     
-    if saved_count > 0:
+    # Save all counts at once and get IDs
+    saved_ids, errors = audit_service.save_batch_counts(count_list)
+    
+    # Upload attachments for successful saves
+    for item, count_id in zip(st.session_state.new_items_list, saved_ids):
+        if count_id:  # Successfully saved
+            temp_id = item.get('temp_id')
+            if temp_id and temp_id in st.session_state.item_attachments:
+                attachments = st.session_state.item_attachments[temp_id]
+                # count_id is the entity_id for entity_type='count_detail'
+                upload_count_attachments(count_id, attachments, transaction_code)
+    
+    # Count successes
+    successful_saves = len([id for id in saved_ids if id is not None])
+    
+    if successful_saves > 0:
         st.session_state.last_save_time = datetime.now()
         clear_all_items()
         # Clear caches to refresh team data
@@ -687,7 +659,7 @@ def save_items_to_db(transaction_id: int) -> Tuple[int, List[str]]:
         get_team_top_products.clear()
         get_team_physical_count_for_product.clear()
     
-    return saved_count, errors
+    return successful_saves, errors
 
 # ============== UI COMPONENTS ==============
 
@@ -1378,19 +1350,21 @@ def handle_save_action(transaction_id: int):
                 time.sleep(0.01)
             
             # Save to database
-            saved, errors = save_items_to_db(transaction_id)
+            saved_count, errors = save_items_to_db(transaction_id)
             
             progress_bar.progress(100)
             time.sleep(0.5)
             
-            if errors and saved == 0:
+            if errors and saved_count == 0:
                 st.error(f"❌ Failed to save items")
                 for error in errors[:3]:
                     st.caption(f"• {error}")
-            elif errors and saved > 0:
-                st.warning(f"⚠️ Saved {saved} items with {len(errors)} errors")
+            elif errors and saved_count > 0:
+                st.warning(f"⚠️ Saved {saved_count} items with {len(errors)} errors")
+                for error in errors[:3]:  # Show first 3 errors
+                    st.caption(f"• {error}")
             else:
-                st.success(f"✅ Successfully saved {saved} items with attachments!")
+                st.success(f"✅ Successfully saved {saved_count} items with attachments!")
                 st.balloons()
                 time.sleep(1)
                 st.rerun()

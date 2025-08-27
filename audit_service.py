@@ -423,8 +423,13 @@ class AuditService:
     
     # ============== OPTIMIZED COUNT DETAILS MANAGEMENT ==============
     
-    def save_count_detail(self, count_data: Dict) -> bool:
-        """Save individual count detail - ALWAYS CREATE NEW RECORD"""
+    def save_count_detail(self, count_data: Dict) -> Optional[int]:
+        """
+        Save individual count detail - ALWAYS CREATE NEW RECORD
+        
+        Returns:
+            int: ID of the created record, or None if failed
+        """
         try:
             # Validate count data
             if count_data.get('actual_quantity', 0) < 0:
@@ -451,19 +456,31 @@ class AuditService:
                 'counted_date': datetime.now()
             }
             
-            self._execute_query(query, params, fetch='none')
-            
-            logger.info(f"Count detail saved for transaction {count_data['transaction_id']}")
-            return True
+            # Execute insert and get the new ID
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                result = conn.execute(text(query), params)
+                conn.commit()
+                
+                # Get the ID of the inserted record
+                count_id = result.lastrowid
+                
+            logger.info(f"Count detail saved with ID {count_id} for transaction {count_data['transaction_id']}")
+            return count_id
             
         except Exception as e:
             logger.error(f"Error saving count detail: {e}")
             raise e
 
-
-    def save_batch_counts(self, count_list: List[Dict]) -> Tuple[int, List[str]]:
-        """Optimized batch save - ALWAYS INSERT NEW RECORDS"""
-        saved_count = 0
+    def save_batch_counts(self, count_list: List[Dict]) -> Tuple[List[int], List[str]]:
+        """
+        Optimized batch save - ALWAYS INSERT NEW RECORDS
+        
+        Returns:
+            Tuple[List[int], List[str]]: (list of saved IDs, list of errors)
+            - saved IDs will have None for failed items
+        """
+        saved_ids = []
         errors = []
         transaction_id = None
         
@@ -477,6 +494,7 @@ class AuditService:
                         # Validate each count
                         if count_data.get('actual_quantity', 0) <= 0:
                             errors.append(f"Row {i+1}: Actual quantity must be greater than 0")
+                            saved_ids.append(None)
                             continue
                         
                         # Store transaction_id for later update
@@ -516,31 +534,34 @@ class AuditService:
                             'created_by_user_id': count_data['created_by_user_id'],
                             'counted_date': datetime.now()
                         }
-                        conn.execute(text(insert_query), insert_params)
+                        result = conn.execute(text(insert_query), insert_params)
                         
-                        saved_count += 1
+                        # Get the inserted ID
+                        count_id = result.lastrowid
+                        saved_ids.append(count_id)
                         
                     except Exception as e:
                         errors.append(f"Row {i+1}: {str(e)}")
+                        saved_ids.append(None)
                         logger.error(f"Error saving count {i+1}: {e}")
                         continue
                 
                 # Update transaction counts if any saved
-                if saved_count > 0 and transaction_id:
+                successful_saves = [id for id in saved_ids if id is not None]
+                if successful_saves and transaction_id:
                     update_query = self.queries.UPDATE_TRANSACTION_COUNTS
                     conn.execute(text(update_query), {'transaction_id': transaction_id})
             
             # Log performance
             elapsed = time.time() - start_time
-            logger.info(f"Batch save completed: {saved_count} saved, {len(errors)} errors in {elapsed:.2f}s")
+            logger.info(f"Batch save completed: {len(successful_saves)} saved, {len(errors)} errors in {elapsed:.2f}s")
             
-            return saved_count, errors
+            return saved_ids, errors
             
         except Exception as e:
             logger.error(f"Error in batch save: {e}")
-            raise e
-    
-    
+            raise e 
+        
 
     def get_recent_counts(self, transaction_id: int, limit: int = 10) -> List[Dict]:
         """Get recent counts for transaction"""
@@ -1016,18 +1037,39 @@ class AuditService:
         
         # Trong audit_service.py
 
+
     def save_media_attachment(self, attachment_data: Dict) -> int:
-        """Save media attachment record to database"""
+        """
+        Save media attachment record to database
+        
+        Args:
+            attachment_data: Dictionary containing:
+                - entity_type: 'session', 'transaction', or 'count_detail'
+                - entity_id: ID from corresponding table (audit_sessions.id, audit_transactions.id, or audit_count_details.id)
+                - other attachment fields
+        
+        Returns:
+            int: ID of the created attachment record
+        """
         try:
+            # Validate entity_type
+            valid_entity_types = ['session', 'transaction', 'count_detail']
+            if attachment_data.get('entity_type') not in valid_entity_types:
+                raise ValueError(f"Invalid entity_type. Must be one of: {valid_entity_types}")
+            
+            # Validate entity_id exists
+            if not attachment_data.get('entity_id'):
+                raise ValueError("entity_id is required")
+            
             query = """
             INSERT INTO audit_media_attachments (
                 entity_type, entity_id, file_name, file_type,
                 mime_type, file_size, s3_key, s3_bucket,
-                description, uploaded_by_user_id
+                description, uploaded_by_user_id, uploaded_date
             ) VALUES (
                 :entity_type, :entity_id, :file_name, :file_type,
                 :mime_type, :file_size, :s3_key, :s3_bucket,
-                :description, :uploaded_by_user_id
+                :description, :uploaded_by_user_id, NOW()
             )
             """
             
@@ -1035,14 +1077,27 @@ class AuditService:
             with engine.connect() as conn:
                 result = conn.execute(text(query), attachment_data)
                 conn.commit()
-                return result.lastrowid
+                attachment_id = result.lastrowid
                 
+            logger.info(f"Media attachment saved with ID {attachment_id} for {attachment_data['entity_type']} {attachment_data['entity_id']}")
+            return attachment_id
+            
         except Exception as e:
             logger.error(f"Error saving media attachment: {e}")
             raise e
 
+
     def get_entity_attachments(self, entity_type: str, entity_id: int) -> List[Dict]:
-        """Get all attachments for an entity"""
+        """
+        Get all attachments for an entity
+        
+        Args:
+            entity_type: 'session', 'transaction', or 'count_detail'
+            entity_id: ID from the corresponding table
+        
+        Returns:
+            List of attachment dictionaries
+        """
         try:
             query = """
             SELECT 
@@ -1067,8 +1122,18 @@ class AuditService:
             logger.error(f"Error getting attachments: {e}")
             return []
 
+
     def delete_attachment(self, attachment_id: int, user_id: int) -> bool:
-        """Soft delete attachment"""
+        """
+        Soft delete attachment
+        
+        Args:
+            attachment_id: ID of attachment to delete
+            user_id: ID of user performing deletion
+        
+        Returns:
+            bool: True if successful
+        """
         try:
             query = """
             UPDATE audit_media_attachments
@@ -1084,6 +1149,7 @@ class AuditService:
                 'user_id': user_id
             }, fetch='none')
             
+            logger.info(f"Attachment {attachment_id} soft deleted by user {user_id}")
             return True
             
         except Exception as e:
