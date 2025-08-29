@@ -35,7 +35,7 @@ audit_service = AuditService()
 # DEFAULT USER ID
 DEFAULT_USER_ID = 2
 DEFAULT_USERNAME = "Default User"
-DEFAULT_USER_DISPLAY = "Default User"
+DEFAULT_USER_DISPLAY = "Han Le"
 
 # ============== SESSION STATE INITIALIZATION ==============
 def init_session_state():
